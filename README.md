@@ -1,4 +1,4 @@
-# AI Dev Team Harness — Phases 1–4A
+# AI Dev Team Harness — Phases 1–4B
 
 Sequential local-first orchestration with Codex as leader and independent reviewer, Antigravity CLI as the implementation worker, and 9Router as the Codex model gateway.
 
@@ -7,6 +7,8 @@ Phase 2 adds a local stdio MCP server so Codex can delegate to Antigravity inter
 Phase 3 adds bounded parallel execution with disjoint worker scopes, per-shard review, sequential integration, and a final integration review.
 
 Phase 4A adds a secure local read-only HTTP observation API and `harness ui` CLI entrypoint.
+
+Phase 4B adds a polished, responsive local operations console dashboard in `ui/` with zero external dependencies, safe DOM rendering, and real-time monitoring.
 
 ## Phase 1 flow
 
@@ -134,7 +136,17 @@ By default, the server binds strictly to `127.0.0.1` on port `4310`. Configurati
 - `GET /api/parallel-runs/:id/integration-review`: returns the structured Codex integration review verdict, findings, and criteria evidence.
 - `GET /api/parallel-runs/:id/integration-checks`: returns integration validation commands and pass/fail results (with stdout/stderr omitted).
 - `GET /api/parallel-runs/:id/integration-diff`: returns a bounded diff (`{ id, diff, truncated }` or plain text with `Accept: text/plain`).
-- `GET /`: serves static assets from `ui/` when present, or a safe HTML fallback dashboard when Phase 4B assets do not exist yet.
+- `GET /`: serves static assets from `ui/` (`index.html`, `styles.css`, `app.js`), or a safe HTML fallback dashboard when Phase 4B assets do not exist yet.
+
+## Phase 4B: local operations console dashboard
+
+The harness includes a standalone, local-first static dashboard located in `ui/`.
+
+- **Visual design**: dense, dark-neutral developer console surfaces (`#090d13` / `#0e141d`), restrained cyan, green, and amber accents, and clean information hierarchy without gradients or decorative hero banners.
+- **Zero external dependencies**: no external frameworks, no CDN scripts or styles, no remote fonts or icons, and no client-side build step.
+- **Safe DOM rendering policy**: strictly builds DOM using `document.createElement`, `textContent`, and safe DOM node construction; never assigns untrusted API data to `innerHTML`.
+- **Real-time polling & resilience**: polls `/api/parallel-runs` every 3–5 seconds without losing the selected run. Detail endpoints are fetched independently so missing in-progress artifacts never blank the page.
+- **Accessibility & responsiveness**: full keyboard navigation, visible focus states (`:focus-visible`), semantic landmarks (`role="banner"`, `role="main"`, `role="status"`, `aria-live="polite"`), skip links, reduced-motion support (`@media (prefers-reduced-motion: reduce)`), and mobile responsive layout.
 
 ### Security guarantees
 
@@ -142,6 +154,7 @@ By default, the server binds strictly to `127.0.0.1` on port `4310`. Configurati
 - **Read-only**: only `GET` and `HEAD` requests are handled; mutating verbs return `405 Method Not Allowed`.
 - **Path traversal and symlink protection**: all run IDs and file access are verified against traversal and symlink escapes.
 - **Information leakage protection**: raw process stdout/stderr logs are omitted, and JSON error responses never leak stack traces or internal secrets.
+- **XSS immunity**: safe DOM construction policy guarantees no untrusted API values are rendered via `innerHTML`.
 
 ## Commands
 
