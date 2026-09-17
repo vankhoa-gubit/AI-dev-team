@@ -1,4 +1,4 @@
-# AI Dev Team Harness — Phases 1–4C
+# AI Dev Team Harness — Phases 1–4D
 
 Sequential local-first orchestration with Codex as leader and independent reviewer, Antigravity CLI as the implementation worker, and 9Router as the Codex model gateway.
 
@@ -11,6 +11,8 @@ Phase 4A adds a secure local read-only HTTP observation API and `harness ui` CLI
 Phase 4B adds a polished, responsive local operations console dashboard in `ui/` with zero external dependencies, safe DOM rendering, and real-time monitoring.
 
 Phase 4C adds asynchronous parallel run execution from the UI, operation metadata persistence under `.harness/ui/operations`, safe tracked child process cancellation, and dashboard controls.
+
+Phase 4D adds retry and replan terminal operations with durable parent/child lineage, and safely prepared copyable cherry-pick commands for approved runs without executing Git integration mutations.
 
 ## Phase 1 flow
 
@@ -170,6 +172,21 @@ Phase 4C adds secure run initiation and process tracking from the local UI:
 - **Sanitization & redaction**: raw stdout and stderr are omitted from operation APIs; sensitive credentials, API keys, and arbitrary filesystem paths outside the submitted repository path are redacted.
 - **Dashboard controls**: an accessible New Run form, Active Operations console, and Cancel button shown strictly for cancellable operations.
 - **Safety guarantee**: runs execute in isolated Git worktrees and never auto-merge the original checkout.
+
+## Phase 4D: retry, replan, durable lineage, and safe cherry-pick preparation
+
+Phase 4D adds lifecycle retry and replanning with lineage tracking and safe cherry-pick command preparation:
+
+- **POST /api/operations/:id/retry**: validates the source operation, permits only `COMPLETED` or `FAILED` sources (rejecting non-terminal or cancelled runs with 409 Conflict), launches a new parallel operation with the stored repository path and original requirement, and immediately returns the new operation ID.
+- **POST /api/operations/:id/replan**: requires `application/json` with bounded non-empty human feedback (<= 20,000 characters), permits only `COMPLETED` or `FAILED` source operations, clearly appends the human feedback to the requirement, and launches the replanned operation immediately.
+- **Durable Lineage Persistence**: child records store `parentId`, `rootId`, `action` (`"retry"` or `"replan"`), and feedback; parent records expose `childOperationIds`. Atomic write queues per operation ID ensure concurrent operations never drop child IDs or lose terminal status.
+- **GET/POST /api/parallel-runs/:id/prepare-cherry-pick**: accepts a validated parallel run ID, reads only the safe `status.json` artifact, verifies state is `DONE`, validates `repositoryPath` is an existing local Git repository, and returns `{ runId, sha, integrationCommitSha, repositoryPath, argv, command }` with self-contained `argv: ["git", "-C", repositoryPath, "cherry-pick", sha]` and safely formatted command.
+- **Zero Git Mutation Guarantee**: cherry-pick preparation is strictly read-only and never executes `git cherry-pick`, `merge`, `checkout`, `reset`, or branch/worktree mutations. The target repository HEAD and working tree remain completely untouched.
+- **Dashboard UI Controls**:
+  - Exposes **Retry** and **Replan** action buttons only on eligible terminal operations (`COMPLETED` or `FAILED`).
+  - Accessible inline replan form collects bounded feedback with full keyboard navigation and clear validation messages.
+  - Operations display explicit parent/child lineage links and replan feedback history.
+  - Exposes **Copy Cherry-pick Command** only for linked `DONE` runs that have an approved integration commit.
 
 ## Commands
 

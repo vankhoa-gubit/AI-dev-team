@@ -15,6 +15,14 @@ import {
 export { assertValidOperationId, isValidOperationId };
 
 export type OperationStatus = "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
+export type OperationAction = "start" | "retry" | "replan";
+
+export interface OperationLineage {
+  parentId?: string | undefined;
+  rootId?: string | undefined;
+  action?: OperationAction | undefined;
+  feedback?: string | undefined;
+}
 
 export interface OperationRecord {
   id: string;
@@ -28,6 +36,13 @@ export interface OperationRecord {
   message?: string | undefined;
   exitCode?: number | null | undefined;
   cancellable?: boolean | undefined;
+
+  // Phase 4D Lineage metadata
+  parentId?: string | undefined;
+  rootId?: string | undefined;
+  action?: OperationAction | undefined;
+  feedback?: string | undefined;
+  childOperationIds?: string[] | undefined;
 }
 
 export interface SanitizedOperation {
@@ -42,6 +57,14 @@ export interface SanitizedOperation {
   message?: string | undefined;
   exitCode?: number | null | undefined;
   cancellable: boolean;
+
+  // Phase 4D Lineage metadata
+  parentId?: string | undefined;
+  rootId?: string | undefined;
+  action?: OperationAction | undefined;
+  feedback?: string | undefined;
+  childOperationIds: string[];
+  lineage?: OperationLineage | undefined;
 }
 
 export function sanitizeMessage(rawMessage: string, allowedRepoPath: string): string {
@@ -108,6 +131,22 @@ export function sanitizeMessage(rawMessage: string, allowedRepoPath: string): st
   return msg;
 }
 
+export function composeReplanRequirement(baseRequirement: string, feedback: string): string {
+  if (typeof feedback !== "string" || !feedback.trim()) {
+    throw new SecurityError("feedback must be a non-empty string", 400);
+  }
+  const trimmedFeedback = feedback.trim();
+  if (trimmedFeedback.length > 20_000) {
+    throw new SecurityError("feedback exceeds maximum allowed length of 20000 characters", 400);
+  }
+  const trimmedBase = (baseRequirement ?? "").trim();
+  const composed = `${trimmedBase}\n\nReplan Feedback:\n${trimmedFeedback}`;
+  if (composed.length > 20_000) {
+    throw new SecurityError("Combined requirement exceeds maximum allowed length of 20000 characters", 400);
+  }
+  return composed;
+}
+
 export interface OperationManagerOptions {
   harnessRoot: string;
   dataDirectory?: string | undefined;
@@ -123,6 +162,7 @@ export class OperationManager {
   private readonly cancelledOperations = new Set<string>();
   private readonly terminalOperations = new Map<string, OperationRecord>();
   private readonly writeQueues = new Map<string, Promise<void>>();
+  private readonly activeActionLocks = new Set<string>();
 
   constructor(options: OperationManagerOptions) {
     this.harnessRoot = path.resolve(options.harnessRoot);
@@ -162,6 +202,11 @@ export class OperationManager {
       op.cancellable = false;
       if (!op.message) op.message = terminal.message;
       if (!op.runId) op.runId = terminal.runId;
+      if (op.childOperationIds) terminal.childOperationIds = op.childOperationIds;
+      if (op.parentId) terminal.parentId = op.parentId;
+      if (op.rootId) terminal.rootId = op.rootId;
+      if (op.action) terminal.action = op.action;
+      if (op.feedback) terminal.feedback = op.feedback;
     } else if (op.status === "COMPLETED" || op.status === "FAILED" || op.status === "CANCELLED") {
       this.terminalOperations.set(op.id, { ...op });
     }
@@ -175,6 +220,37 @@ export class OperationManager {
       });
     this.writeQueues.set(op.id, next);
     return next;
+  }
+
+  async addChildOperation(parentId: string, childId: string): Promise<void> {
+    assertValidOperationId(parentId);
+    assertValidOperationId(childId);
+
+    const prev = this.writeQueues.get(parentId) ?? Promise.resolve();
+    const next = prev
+      .catch(() => {})
+      .then(async () => {
+        const parent = await this.getOperationRaw(parentId);
+        if (!parent) return;
+
+        const existingChildren = new Set(parent.childOperationIds ?? []);
+        existingChildren.add(childId);
+        parent.childOperationIds = Array.from(existingChildren);
+
+        const terminal = this.terminalOperations.get(parentId);
+        if (terminal) {
+          parent.status = terminal.status;
+          parent.completedAt = terminal.completedAt;
+          parent.exitCode = terminal.exitCode;
+          parent.cancellable = false;
+          terminal.childOperationIds = parent.childOperationIds;
+        }
+
+        await this.doAtomicPersist(parent);
+      });
+
+    this.writeQueues.set(parentId, next);
+    await next;
   }
 
   private async doAtomicPersist(op: OperationRecord): Promise<void> {
@@ -200,6 +276,16 @@ export class OperationManager {
   sanitize(op: OperationRecord): SanitizedOperation {
     const isLive = this.liveProcesses.has(op.id);
     const isCancellable = op.status === "RUNNING" && isLive;
+    const childOperationIds = Array.isArray(op.childOperationIds) ? [...op.childOperationIds] : [];
+    const rootId = op.rootId ?? op.parentId ?? op.id;
+    const action = op.action ?? "start";
+
+    const lineage: OperationLineage = {
+      parentId: op.parentId,
+      rootId,
+      action,
+      feedback: op.feedback,
+    };
 
     return {
       id: op.id,
@@ -213,6 +299,12 @@ export class OperationManager {
       message: op.message ? sanitizeMessage(op.message, op.repositoryPath) : undefined,
       exitCode: op.exitCode,
       cancellable: isCancellable,
+      parentId: op.parentId,
+      rootId,
+      action,
+      feedback: op.feedback,
+      childOperationIds,
+      lineage,
     };
   }
 
@@ -317,11 +409,187 @@ export class OperationManager {
       startedAt: new Date().toISOString(),
       cancellable: true,
       message: "Starting parallel harness run...",
+      action: "start",
+      rootId: id,
+      childOperationIds: [],
     };
 
     await this.persistOperation(operation);
+    this.spawnOperationProcess(operation, resolvedRepo, boundedRequirement);
+    return this.sanitize(operation);
+  }
 
-    // Launch child process with shell: false and argv array
+  async retryOperation(sourceOperationId: string): Promise<SanitizedOperation> {
+    assertValidOperationId(sourceOperationId);
+
+    const actionKey = `${sourceOperationId}:retry`;
+    if (this.activeActionLocks.has(actionKey)) {
+      throw new ConflictError(
+        `Cannot retry operation '${sourceOperationId}': a retry operation is already in progress`,
+      );
+    }
+
+    this.activeActionLocks.add(actionKey);
+
+    try {
+      const parent = await this.getOperationRaw(sourceOperationId);
+      if (!parent) {
+        throw new NotFoundError(`Operation '${sourceOperationId}' not found`);
+      }
+
+      if (parent.status !== "COMPLETED" && parent.status !== "FAILED") {
+        throw new ConflictError(
+          `Cannot retry operation '${sourceOperationId}' with status '${parent.status}': only COMPLETED or FAILED operations can be retried`,
+        );
+      }
+
+      // Durable child-state check: verify no child from this parent is currently RUNNING with action retry
+      if (parent.childOperationIds && parent.childOperationIds.length > 0) {
+        for (const childId of parent.childOperationIds) {
+          const terminalChild = this.terminalOperations.get(childId);
+          if (terminalChild) {
+            if (terminalChild.action === "retry" && terminalChild.status === "RUNNING") {
+              throw new ConflictError(
+                `Cannot retry operation '${sourceOperationId}': active retry child '${childId}' is currently running`,
+              );
+            }
+          } else {
+            const childOp = await this.getOperationRaw(childId);
+            if (childOp && childOp.action === "retry" && childOp.status === "RUNNING") {
+              throw new ConflictError(
+                `Cannot retry operation '${sourceOperationId}': active retry child '${childId}' is currently running`,
+              );
+            }
+          }
+        }
+      }
+
+      const { resolvedRepo, boundedRequirement } = await this.validateRunRequest(
+        parent.repositoryPath,
+        parent.requirement,
+      );
+
+      const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+      const id = `op-${timestamp}-${randomUUID().slice(0, 8)}`;
+      const rootId = parent.rootId ?? parent.id;
+
+      const operation: OperationRecord = {
+        id,
+        status: "RUNNING",
+        type: "parallel_run",
+        repositoryPath: resolvedRepo,
+        requirement: boundedRequirement,
+        startedAt: new Date().toISOString(),
+        cancellable: true,
+        message: "Starting parallel harness run (retry)...",
+        action: "retry",
+        parentId: sourceOperationId,
+        rootId,
+        childOperationIds: [],
+      };
+
+      await this.persistOperation(operation);
+      await this.addChildOperation(sourceOperationId, id);
+      this.spawnOperationProcess(operation, resolvedRepo, boundedRequirement, () => {
+        this.activeActionLocks.delete(actionKey);
+      });
+      return this.sanitize(operation);
+    } catch (err) {
+      this.activeActionLocks.delete(actionKey);
+      throw err;
+    }
+  }
+
+  async replanOperation(sourceOperationId: string, feedback: string): Promise<SanitizedOperation> {
+    assertValidOperationId(sourceOperationId);
+
+    const actionKey = `${sourceOperationId}:replan`;
+    if (this.activeActionLocks.has(actionKey)) {
+      throw new ConflictError(
+        `Cannot replan operation '${sourceOperationId}': a replan operation is already in progress`,
+      );
+    }
+
+    this.activeActionLocks.add(actionKey);
+
+    try {
+      const parent = await this.getOperationRaw(sourceOperationId);
+      if (!parent) {
+        throw new NotFoundError(`Operation '${sourceOperationId}' not found`);
+      }
+
+      if (parent.status !== "COMPLETED" && parent.status !== "FAILED") {
+        throw new ConflictError(
+          `Cannot replan operation '${sourceOperationId}' with status '${parent.status}': only COMPLETED or FAILED operations can be replanned`,
+        );
+      }
+
+      // Durable child-state check: verify no child from this parent is currently RUNNING with action replan
+      if (parent.childOperationIds && parent.childOperationIds.length > 0) {
+        for (const childId of parent.childOperationIds) {
+          const terminalChild = this.terminalOperations.get(childId);
+          if (terminalChild) {
+            if (terminalChild.action === "replan" && terminalChild.status === "RUNNING") {
+              throw new ConflictError(
+                `Cannot replan operation '${sourceOperationId}': active replan child '${childId}' is currently running`,
+              );
+            }
+          } else {
+            const childOp = await this.getOperationRaw(childId);
+            if (childOp && childOp.action === "replan" && childOp.status === "RUNNING") {
+              throw new ConflictError(
+                `Cannot replan operation '${sourceOperationId}': active replan child '${childId}' is currently running`,
+              );
+            }
+          }
+        }
+      }
+
+      const composedRequirement = composeReplanRequirement(parent.requirement, feedback);
+      const { resolvedRepo, boundedRequirement } = await this.validateRunRequest(
+        parent.repositoryPath,
+        composedRequirement,
+      );
+
+      const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+      const id = `op-${timestamp}-${randomUUID().slice(0, 8)}`;
+      const rootId = parent.rootId ?? parent.id;
+
+      const operation: OperationRecord = {
+        id,
+        status: "RUNNING",
+        type: "parallel_run",
+        repositoryPath: resolvedRepo,
+        requirement: boundedRequirement,
+        startedAt: new Date().toISOString(),
+        cancellable: true,
+        message: "Starting parallel harness run (replan)...",
+        action: "replan",
+        parentId: sourceOperationId,
+        rootId,
+        feedback: feedback.trim(),
+        childOperationIds: [],
+      };
+
+      await this.persistOperation(operation);
+      await this.addChildOperation(sourceOperationId, id);
+      this.spawnOperationProcess(operation, resolvedRepo, boundedRequirement, () => {
+        this.activeActionLocks.delete(actionKey);
+      });
+      return this.sanitize(operation);
+    } catch (err) {
+      this.activeActionLocks.delete(actionKey);
+      throw err;
+    }
+  }
+
+  private spawnOperationProcess(
+    operation: OperationRecord,
+    resolvedRepo: string,
+    boundedRequirement: string,
+    onComplete?: () => void,
+  ): void {
+    const id = operation.id;
     const args = [this.cliScriptPath, "parallel", "--repo", resolvedRepo, "--requirement", boundedRequirement];
 
     let child: ChildProcess;
@@ -333,13 +601,14 @@ export class OperationManager {
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (error) {
+      onComplete?.();
       operation.status = "FAILED";
       operation.completedAt = new Date().toISOString();
       operation.message = this.sanitizeErrorMessage(error, resolvedRepo);
       operation.cancellable = false;
       this.terminalOperations.set(id, { ...operation });
-      await this.persistOperation(operation);
-      return this.sanitize(operation);
+      void this.persistOperation(operation);
+      return;
     }
 
     this.liveProcesses.set(id, child);
@@ -379,6 +648,7 @@ export class OperationManager {
     });
 
     child.once("error", (err) => {
+      onComplete?.();
       this.liveProcesses.delete(id);
       if (this.cancelledOperations.has(id) || operation.status === "CANCELLED") return;
 
@@ -391,6 +661,7 @@ export class OperationManager {
     });
 
     child.once("close", (exitCode, signal) => {
+      onComplete?.();
       this.liveProcesses.delete(id);
       if (this.cancelledOperations.has(id) || operation.status === "CANCELLED") return;
 
@@ -415,8 +686,6 @@ export class OperationManager {
       this.terminalOperations.set(id, { ...operation });
       void this.persistOperation(operation);
     });
-
-    return this.sanitize(operation);
   }
 
   async cancelOperation(id: string): Promise<SanitizedOperation> {
@@ -451,6 +720,10 @@ export class OperationManager {
       child.kill("SIGTERM");
     } catch {
       // Ignore kill errors
+    }
+
+    if (op.parentId && op.action) {
+      this.activeActionLocks.delete(`${op.parentId}:${op.action}`);
     }
 
     await this.persistOperation(op);

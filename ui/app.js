@@ -419,6 +419,18 @@ function renderOverview(summary) {
       conflictsBanner.classList.add("hidden");
     }
   }
+
+  // Phase 4D: Copy Cherry-pick Command button (only for DONE run with integrationCommitSha)
+  const cherryPickBtn = document.getElementById("btn-copy-cherry-pick");
+  if (cherryPickBtn) {
+    const isDoneWithCommit = summary.state === "DONE" && Boolean(summary.integrationCommitSha);
+    if (isDoneWithCommit) {
+      cherryPickBtn.classList.remove("hidden");
+      cherryPickBtn.disabled = false;
+    } else {
+      cherryPickBtn.classList.add("hidden");
+    }
+  }
 }
 
 /**
@@ -984,8 +996,114 @@ function renderOperations() {
   }
 
   for (const op of operations) {
+    const isEligibleForRetryReplan =
+      (op.status === "COMPLETED" || op.status === "FAILED") && !op.cancellable;
+
+    const actionBadge =
+      op.action && op.action !== "start"
+        ? el("span", {
+            className: "badge badge-neutral action-tag font-mono",
+            textContent: op.action.toUpperCase(),
+          })
+        : null;
+
+    // Lineage children list
+    const childrenList =
+      op.childOperationIds && op.childOperationIds.length > 0
+        ? el("div", { className: "operation-children-row font-mono" }, [
+            el("strong", { textContent: `Children (${op.childOperationIds.length}): ` }),
+            ...op.childOperationIds.flatMap((cid, idx) => [
+              idx > 0 ? document.createTextNode(", ") : null,
+              el("a", {
+                className: "lineage-link",
+                href: `#op-item-${cid}`,
+                textContent: cid,
+                onclick: (e) => {
+                  e.preventDefault();
+                  scrollToOperation(cid);
+                },
+              }),
+            ]),
+          ])
+        : null;
+
+    // Lineage parent link
+    const parentLine = op.parentId
+      ? el("div", { className: "operation-lineage-row font-mono" }, [
+          el("strong", { textContent: "Parent: " }),
+          el("a", {
+            className: "lineage-link",
+            href: `#op-item-${op.parentId}`,
+            textContent: op.parentId,
+            onclick: (e) => {
+              e.preventDefault();
+              scrollToOperation(op.parentId);
+            },
+          }),
+          op.rootId && op.rootId !== op.id && op.rootId !== op.parentId
+            ? el("span", { className: "form-hint", textContent: ` (Root: ${op.rootId})` })
+            : null,
+        ])
+      : null;
+
+    // Lineage feedback
+    const feedbackNote = op.feedback
+      ? el("div", { className: "operation-feedback-line" }, [
+          el("strong", { textContent: "Replan Feedback: " }),
+          el("span", { textContent: op.feedback }),
+        ])
+      : null;
+
+    // Replan form (only for eligible operations)
+    const replanForm = isEligibleForRetryReplan
+      ? el(
+          "div",
+          {
+            className: "replan-form-wrap hidden",
+            id: `replan-form-${op.id}`,
+            role: "region",
+            "aria-label": `Replan feedback form for operation ${op.id}`,
+          },
+          [
+            el("label", {
+              className: "form-label",
+              htmlFor: `input-replan-feedback-${op.id}`,
+              textContent: "Replan Feedback / Guidance:",
+            }),
+            el("textarea", {
+              className: "form-textarea replan-textarea",
+              id: `input-replan-feedback-${op.id}`,
+              placeholder: "Describe required adjustments or fixes for the next plan...",
+              rows: 2,
+              maxLength: 20000,
+              "aria-required": "true",
+            }),
+            el("div", { className: "form-actions-row" }, [
+              el("button", {
+                type: "button",
+                className: "btn btn-primary btn-sm btn-submit-replan",
+                textContent: "Submit Replan",
+                onclick: () => handleReplanOperation(op.id),
+              }),
+              el("button", {
+                type: "button",
+                className: "btn btn-secondary btn-sm btn-cancel-replan",
+                textContent: "Cancel",
+                onclick: () => toggleReplanForm(op.id, false),
+              }),
+            ]),
+            el("div", {
+              className: "form-feedback hidden",
+              id: `replan-feedback-${op.id}`,
+              role: "status",
+              "aria-live": "polite",
+            }),
+          ],
+        )
+      : null;
+
     const item = el("div", { className: "operation-item", id: `op-item-${op.id}` }, [
-      // Header: ID + State Badge
+      // Header: ID + State Badge + Action Badge
       el("div", { className: "operation-header" }, [
         el("div", { className: "operation-id-wrap" }, [
           el("span", { className: "code-tag font-mono", textContent: op.id }),
@@ -993,6 +1111,7 @@ function renderOperations() {
             className: `badge ${getStateBadgeClass(op.status)}`,
             textContent: op.status,
           }),
+          actionBadge,
         ]),
         el("span", {
           className: "form-hint font-mono",
@@ -1000,7 +1119,7 @@ function renderOperations() {
         }),
       ]),
 
-      // Body: Repo + Requirement + Message
+      // Body: Repo + Requirement + Message + Lineage
       el("div", { className: "operation-body" }, [
         el("div", { className: "operation-repo-line" }, [
           el("strong", { textContent: "Repo: " }),
@@ -1010,9 +1129,12 @@ function renderOperations() {
         op.message
           ? el("div", { className: "operation-msg-text font-mono", textContent: op.message })
           : null,
+        parentLine,
+        feedbackNote,
+        childrenList,
       ]),
 
-      // Footer: Linked Run & Cancel Control (shown only for cancellable operations!)
+      // Footer: Linked Run & Controls
       el("div", { className: "operation-footer" }, [
         op.runId
           ? el("a", {
@@ -1036,10 +1158,193 @@ function renderOperations() {
               onClick: () => handleCancelOperation(op.id),
             })
           : null,
+
+        // Retry & Replan controls: shown ONLY for eligible terminal operations!
+        isEligibleForRetryReplan
+          ? el("div", { className: "operation-actions-wrap" }, [
+              el("button", {
+                className: "btn btn-secondary btn-sm btn-retry-operation",
+                id: `btn-retry-${op.id}`,
+                textContent: "Retry",
+                "aria-label": `Retry operation ${op.id}`,
+                onClick: () => handleRetryOperation(op.id),
+              }),
+              el("button", {
+                className: "btn btn-secondary btn-sm btn-replan-operation",
+                id: `btn-replan-${op.id}`,
+                textContent: "Replan",
+                "aria-label": `Replan operation ${op.id}`,
+                "aria-expanded": "false",
+                onClick: () => toggleReplanForm(op.id),
+              }),
+            ])
+          : null,
       ]),
+
+      replanForm,
     ]);
 
     container.appendChild(item);
+  }
+}
+
+/**
+ * Scroll to and highlight an operation item in the console
+ */
+function scrollToOperation(opId) {
+  const target = document.getElementById(`op-item-${opId}`);
+  if (target) {
+    target.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    target.classList.add("highlighted");
+    setTimeout(() => target.classList.remove("highlighted"), 2000);
+  }
+}
+
+/**
+ * Toggle replan form visibility
+ */
+function toggleReplanForm(opId, forceState) {
+  const form = document.getElementById(`replan-form-${opId}`);
+  const btn = document.getElementById(`btn-replan-${opId}`);
+  if (!form) return;
+  const isHidden = typeof forceState === "boolean" ? !forceState : form.classList.contains("hidden");
+  if (isHidden) {
+    form.classList.remove("hidden");
+    if (btn) btn.setAttribute("aria-expanded", "true");
+    const input = document.getElementById(`input-replan-feedback-${opId}`);
+    input?.focus();
+  } else {
+    form.classList.add("hidden");
+    if (btn) btn.setAttribute("aria-expanded", "false");
+  }
+}
+
+/**
+ * Handle operation retry
+ */
+async function handleRetryOperation(opId) {
+  const btn = document.getElementById(`btn-retry-${opId}`);
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Retrying...";
+  }
+
+  try {
+    const res = await fetch(`/api/operations/${encodeURIComponent(opId)}/retry`, {
+      method: "POST",
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try {
+        const data = await res.json();
+        if (data?.error) msg = data.error;
+      } catch {}
+      throw new Error(msg);
+    }
+    await pollOperations();
+    await pollRuns();
+  } catch (err) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Retry";
+    }
+    showFeedback("form-feedback", `Failed to retry operation: ${err.message}`, "error");
+  }
+}
+
+/**
+ * Handle operation replan
+ */
+async function handleReplanOperation(opId) {
+  const input = document.getElementById(`input-replan-feedback-${opId}`);
+  const feedbackText = input ? input.value.trim() : "";
+  const fbEl = `replan-feedback-${opId}`;
+
+  if (!feedbackText) {
+    showFeedback(fbEl, "Feedback is required for replan.", "error");
+    input?.focus();
+    return;
+  }
+
+  const submitBtn = document.querySelector(`#replan-form-${CSS.escape(opId)} .btn-submit-replan`);
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Starting Replan...";
+  }
+
+  try {
+    const res = await fetch(`/api/operations/${encodeURIComponent(opId)}/replan`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ feedback: feedbackText }),
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try {
+        const data = await res.json();
+        if (data?.error) msg = data.error;
+      } catch {}
+      throw new Error(msg);
+    }
+    toggleReplanForm(opId, false);
+    if (input) input.value = "";
+    await pollOperations();
+    await pollRuns();
+  } catch (err) {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Submit Replan";
+    }
+    showFeedback(fbEl, `Failed to replan: ${err.message}`, "error");
+  }
+}
+
+/**
+ * Handle copy cherry-pick command for active run
+ */
+async function handleCopyCherryPick() {
+  if (!selectedRunId) return;
+  const btn = document.getElementById("btn-copy-cherry-pick");
+  if (btn) btn.disabled = true;
+
+  try {
+    const data = await fetchJson(
+      `/api/parallel-runs/${encodeURIComponent(selectedRunId)}/prepare-cherry-pick`,
+    );
+    if (data && data.command) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(data.command);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = data.command;
+        ta.style.position = "fixed";
+        ta.style.top = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      if (btn) {
+        const orig = btn.textContent;
+        btn.textContent = "Command Copied!";
+        setTimeout(() => {
+          btn.textContent = orig;
+          btn.disabled = false;
+        }, 1800);
+      }
+    }
+  } catch (err) {
+    if (btn) {
+      btn.textContent = "Copy Failed";
+      setTimeout(() => {
+        btn.textContent = "Copy Cherry-pick Command";
+        btn.disabled = false;
+      }, 2000);
+    }
   }
 }
 
@@ -1193,6 +1498,11 @@ function init() {
   const copyDiffBtn = document.getElementById("btn-copy-diff");
   if (copyDiffBtn) {
     copyDiffBtn.addEventListener("click", copyDiffToClipboard);
+  }
+
+  const copyCherryPickBtn = document.getElementById("btn-copy-cherry-pick");
+  if (copyCherryPickBtn) {
+    copyCherryPickBtn.addEventListener("click", handleCopyCherryPick);
   }
 
   const searchInput = document.getElementById("run-search");

@@ -1318,3 +1318,75 @@ body {
   border-color: rgba(248, 81, 73, 0.6);
   color: #fff;
 }
+
+/* Phase 4D styles */
+.overview-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.operation-actions-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.operation-lineage-row,
+.operation-children-row {
+  font-size: 0.73rem;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.operation-feedback-line {
+  font-size: 0.74rem;
+  color: var(--accent-amber);
+  background: rgba(210, 153, 34, 0.08);
+  border-left: 2px solid var(--accent-amber);
+  padding: 0.25rem 0.5rem;
+  border-radius: var(--radius-sm);
+}
+
+.lineage-link {
+  color: var(--accent-cyan);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.lineage-link:hover {
+  color: #fff;
+}
+
+.action-tag {
+  font-size: 0.65rem;
+  letter-spacing: 0.05em;
+  padding: 0.1rem 0.35rem;
+}
+
+.replan-form-wrap {
+  margin-top: 0.4rem;
+  padding: 0.5rem;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--border-secondary);
+  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.replan-textarea {
+  min-height: 50px;
+  font-size: 0.76rem;
+  resize: vertical;
+}
+
+.operation-item.highlighted {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.3);
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}

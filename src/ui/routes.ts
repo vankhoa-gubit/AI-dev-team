@@ -5,10 +5,12 @@ import type { HarnessConfig } from "../config.js";
 import type { ParallelRunSummary, ParallelShardResult } from "../parallel-types.js";
 import type { CheckResult, ReviewResult } from "../types.js";
 import { getBoundedIntegrationDiff, type BoundedDiffResult } from "./diff.js";
+import { assertGitRepository } from "../git.js";
 import {
   assertSafeChildPath,
   assertValidOperationId,
   assertValidRunId,
+  ConflictError,
   NotFoundError,
   sanitizeErrorMessage,
   SecurityError,
@@ -205,6 +207,110 @@ export async function getIntegrationDiff(
   return diffResult;
 }
 
+export function formatSafeCommand(argv: string[], platform: string = process.platform): string {
+  if (!argv || argv.length === 0) return "";
+
+  return argv
+    .map((arg) => {
+      if (arg === "") return "''";
+      // If arg contains only safe characters: letters, numbers, dash, underscore, dot, slash, colon, equals
+      if (/^[a-zA-Z0-9_\-./:=]+$/.test(arg)) {
+        return arg;
+      }
+      if (platform === "win32") {
+        // PowerShell single-quoted literal: escape embedded apostrophes by doubling them
+        const escaped = arg.replace(/'/g, "''");
+        return `'${escaped}'`;
+      } else {
+        // POSIX single-quote escaping: end single quote, literal escaped single quote, resume single quote
+        const escaped = arg.replace(/'/g, "'\\''");
+        return `'${escaped}'`;
+      }
+    })
+    .join(" ");
+}
+
+export interface PrepareCherryPickResult {
+  runId: string;
+  sha: string;
+  integrationCommitSha: string;
+  repositoryPath: string;
+  argv: string[];
+  command: string;
+}
+
+export async function prepareCherryPick(
+  dataRoot: string,
+  runId: string,
+  platform: string = process.platform,
+): Promise<PrepareCherryPickResult> {
+  assertValidRunId(runId);
+  const runsDirectory = path.join(dataRoot, "parallel-runs");
+  const safeDir = await assertSafeChildPath(runsDirectory, runId);
+  const statusFile = path.join(safeDir, "status.json");
+
+  if (!(await pathExists(statusFile))) {
+    throw new NotFoundError(`Run '${runId}' not found`);
+  }
+
+  const raw = await readFile(statusFile, "utf8");
+  let summary: ParallelRunSummary;
+  try {
+    summary = JSON.parse(raw) as ParallelRunSummary;
+  } catch {
+    throw new SecurityError(`Invalid status artifact for run '${runId}'`, 400);
+  }
+
+  if (summary.state !== "DONE") {
+    throw new ConflictError(
+      `Cannot prepare cherry-pick: run '${runId}' is in state '${summary.state || "UNKNOWN"}', requires state DONE`,
+    );
+  }
+
+  const sha = summary.integrationCommitSha;
+  if (!sha || typeof sha !== "string" || !/^[0-9a-fA-F]{7,40}$/.test(sha.trim())) {
+    throw new ConflictError(
+      `Cannot prepare cherry-pick: run '${runId}' does not have a valid integration commit SHA`,
+    );
+  }
+
+  const repoPath = summary.repositoryPath;
+  if (!repoPath || typeof repoPath !== "string" || !path.isAbsolute(repoPath.trim())) {
+    throw new ConflictError(
+      `Cannot prepare cherry-pick: repositoryPath must be a valid absolute path`,
+    );
+  }
+
+  const cleanRepo = path.resolve(repoPath.trim());
+  try {
+    const st = await stat(cleanRepo);
+    if (!st.isDirectory()) {
+      throw new ConflictError(
+        `Cannot prepare cherry-pick: repositoryPath is not a directory`,
+      );
+    }
+    await assertGitRepository(cleanRepo);
+  } catch (err) {
+    if (err instanceof ConflictError) throw err;
+    throw new ConflictError(
+      `Cannot prepare cherry-pick: repositoryPath is not an existing Git repository`,
+    );
+  }
+
+  const cleanSha = sha.trim();
+  const argv = ["git", "-C", cleanRepo, "cherry-pick", cleanSha];
+  const command = formatSafeCommand(argv, platform);
+
+  return {
+    runId,
+    sha: cleanSha,
+    integrationCommitSha: cleanSha,
+    repositoryPath: cleanRepo,
+    argv,
+    command,
+  };
+}
+
 export function sendJson(res: ServerResponse, statusCode: number, data: unknown): void {
   const payload = JSON.stringify(data);
   res.writeHead(statusCode, {
@@ -228,7 +334,10 @@ export function sendText(res: ServerResponse, statusCode: number, text: string):
 
 const RUN_SUBROUTE_REGEX = /^(?:\/api)?\/(?:parallel-runs|runs)\/([^/]+)(?:\/([^/]+))?\/?$/;
 const OPERATION_CANCEL_REGEX = /^(?:\/api)?\/operations\/([^/]+)\/cancel\/?$/;
+const OPERATION_RETRY_REGEX = /^(?:\/api)?\/operations\/([^/]+)\/retry\/?$/;
+const OPERATION_REPLAN_REGEX = /^(?:\/api)?\/operations\/([^/]+)\/replan\/?$/;
 const OPERATION_ITEM_REGEX = /^(?:\/api)?\/operations\/([^/]+)\/?$/;
+const CHERRY_PICK_POST_REGEX = /^(?:\/api)?\/(?:parallel-runs|runs)\/([^/]+)\/(?:prepare-cherry-pick|cherry-pick)\/?$/;
 
 export async function readBoundedJson(
   req: IncomingMessage,
@@ -340,6 +449,91 @@ export function createHttpHandler(
           return;
         }
 
+        const retryMatch = OPERATION_RETRY_REGEX.exec(pathname);
+        if (retryMatch) {
+          let rawId = retryMatch[1] ?? "";
+          try {
+            rawId = decodeURIComponent(rawId);
+          } catch {
+            throw new SecurityError("Invalid URL encoding in operation id", 400);
+          }
+          assertValidOperationId(rawId);
+
+          const contentType = req.headers["content-type"];
+          if (contentType) {
+            const mediaType = contentType.split(";")[0]?.trim().toLowerCase();
+            if (mediaType !== "application/json") {
+              throw new UnsupportedMediaTypeError("Content-Type must be application/json");
+            }
+            const contentLength = req.headers["content-length"];
+            if (contentLength && contentLength !== "0") {
+              await readBoundedJson(req, 64 * 1024);
+            }
+          }
+
+          const op = await operationManager.retryOperation(rawId);
+          sendJson(res, 201, op);
+          return;
+        }
+
+        const replanMatch = OPERATION_REPLAN_REGEX.exec(pathname);
+        if (replanMatch) {
+          let rawId = replanMatch[1] ?? "";
+          try {
+            rawId = decodeURIComponent(rawId);
+          } catch {
+            throw new SecurityError("Invalid URL encoding in operation id", 400);
+          }
+          assertValidOperationId(rawId);
+
+          const contentType = req.headers["content-type"];
+          const mediaType = contentType ? contentType.split(";")[0]?.trim().toLowerCase() : "";
+          if (mediaType !== "application/json") {
+            throw new UnsupportedMediaTypeError("Content-Type must be application/json");
+          }
+
+          const rawBody = await readBoundedJson(req, 64 * 1024);
+          if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+            throw new SecurityError("Invalid JSON body: expected an object", 400);
+          }
+          const body = rawBody as Record<string, unknown>;
+          const feedback = (body["feedback"] ?? body["humanFeedback"]) as unknown;
+          if (typeof feedback !== "string" || !feedback.trim()) {
+            throw new SecurityError("feedback must be a non-empty string", 400);
+          }
+
+          const op = await operationManager.replanOperation(rawId, feedback);
+          sendJson(res, 201, op);
+          return;
+        }
+
+        const cherryMatch = CHERRY_PICK_POST_REGEX.exec(pathname);
+        if (cherryMatch) {
+          let rawRunId = cherryMatch[1] ?? "";
+          try {
+            rawRunId = decodeURIComponent(rawRunId);
+          } catch {
+            throw new SecurityError("Invalid URL encoding in run id", 400);
+          }
+          assertValidRunId(rawRunId);
+
+          const contentType = req.headers["content-type"];
+          if (contentType) {
+            const mediaType = contentType.split(";")[0]?.trim().toLowerCase();
+            if (mediaType !== "application/json") {
+              throw new UnsupportedMediaTypeError("Content-Type must be application/json");
+            }
+            const contentLength = req.headers["content-length"];
+            if (contentLength && contentLength !== "0") {
+              await readBoundedJson(req, 64 * 1024);
+            }
+          }
+
+          const result = await prepareCherryPick(dataRoot, rawRunId);
+          sendJson(res, 200, result);
+          return;
+        }
+
         sendJson(res, 405, { error: "Method not allowed" });
         return;
       }
@@ -436,6 +630,12 @@ export function createHttpHandler(
               truncated: diffResult.truncated,
             });
           }
+          return;
+        }
+
+        if (subroute === "prepare-cherry-pick" || subroute === "cherry-pick") {
+          const result = await prepareCherryPick(dataRoot, rawRunId);
+          sendJson(res, 200, result);
           return;
         }
 
