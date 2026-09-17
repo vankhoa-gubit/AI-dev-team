@@ -1,0 +1,32 @@
+{
+  "name": "ai-dev-team-harness",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex and Antigravity harness with sequential, interactive MCP, and parallel orchestration",
+  "bin": {
+    "harness": "dist/cli.js",
+    "harness-mcp": "dist/mcp-server.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:compile": "tsc -p tsconfig.test.json",
+    "test": "npm run test:compile && node --test dist-test/tests/core.test.js",
+    "check": "npm run typecheck && npm test && npm run build",
+    "start": "node dist/cli.js",
+    "mcp": "node dist/mcp-server.js"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2"
+  }
+}
