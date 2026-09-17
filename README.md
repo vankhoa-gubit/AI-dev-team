@@ -1,4 +1,4 @@
-# AI Dev Team Harness — Phases 1–4B
+# AI Dev Team Harness — Phases 1–4C
 
 Sequential local-first orchestration with Codex as leader and independent reviewer, Antigravity CLI as the implementation worker, and 9Router as the Codex model gateway.
 
@@ -9,6 +9,8 @@ Phase 3 adds bounded parallel execution with disjoint worker scopes, per-shard r
 Phase 4A adds a secure local read-only HTTP observation API and `harness ui` CLI entrypoint.
 
 Phase 4B adds a polished, responsive local operations console dashboard in `ui/` with zero external dependencies, safe DOM rendering, and real-time monitoring.
+
+Phase 4C adds asynchronous parallel run execution from the UI, operation metadata persistence under `.harness/ui/operations`, safe tracked child process cancellation, and dashboard controls.
 
 ## Phase 1 flow
 
@@ -155,6 +157,19 @@ The harness includes a standalone, local-first static dashboard located in `ui/`
 - **Path traversal and symlink protection**: all run IDs and file access are verified against traversal and symlink escapes.
 - **Information leakage protection**: raw process stdout/stderr logs are omitted, and JSON error responses never leak stack traces or internal secrets.
 - **XSS immunity**: safe DOM construction policy guarantees no untrusted API values are rendered via `innerHTML`.
+
+## Phase 4C: asynchronous run execution, operations persistence, and dashboard controls
+
+Phase 4C adds secure run initiation and process tracking from the local UI:
+
+- **POST /api/runs**: accepts bounded JSON `{ repositoryPath, requirement }`, validates both (path must be absolute, exist, and be a Git repository; requirement bounded to 20,000 chars), launches only the current harness CLI parallel command asynchronously with `shell: false` and argv arrays, and immediately returns an operation ID.
+- **GET /api/operations**: returns a newest-first sanitized list of operation statuses.
+- **GET /api/operations/:id**: returns individual operation details, linking discovered parallel run IDs.
+- **POST /api/operations/:id/cancel**: idempotent endpoint that terminates only live child processes owned and tracked by the operation manager, preserving all worktrees, branches, and run artifacts.
+- **Persistence**: operation metadata is persisted durably under `.harness/ui/operations/<operation-id>.json`.
+- **Sanitization & redaction**: raw stdout and stderr are omitted from operation APIs; sensitive credentials, API keys, and arbitrary filesystem paths outside the submitted repository path are redacted.
+- **Dashboard controls**: an accessible New Run form, Active Operations console, and Cancel button shown strictly for cancellable operations.
+- **Safety guarantee**: runs execute in isolated Git worktrees and never auto-merge the original checkout.
 
 ## Commands
 

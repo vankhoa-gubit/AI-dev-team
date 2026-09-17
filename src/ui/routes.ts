@@ -7,11 +7,14 @@ import type { CheckResult, ReviewResult } from "../types.js";
 import { getBoundedIntegrationDiff, type BoundedDiffResult } from "./diff.js";
 import {
   assertSafeChildPath,
+  assertValidOperationId,
   assertValidRunId,
   NotFoundError,
   sanitizeErrorMessage,
   SecurityError,
+  UnsupportedMediaTypeError,
 } from "./security.js";
+import { OperationManager, type SanitizedOperation } from "./operations.js";
 import { serveStatic } from "./static.js";
 
 export type SanitizedCheckResult = Omit<CheckResult, "stdout" | "stderr">;
@@ -224,29 +227,156 @@ export function sendText(res: ServerResponse, statusCode: number, text: string):
 }
 
 const RUN_SUBROUTE_REGEX = /^(?:\/api)?\/(?:parallel-runs|runs)\/([^/]+)(?:\/([^/]+))?\/?$/;
+const OPERATION_CANCEL_REGEX = /^(?:\/api)?\/operations\/([^/]+)\/cancel\/?$/;
+const OPERATION_ITEM_REGEX = /^(?:\/api)?\/operations\/([^/]+)\/?$/;
 
-export function createHttpHandler(config: HarnessConfig, harnessRoot: string) {
+export async function readBoundedJson(
+  req: IncomingMessage,
+  maxSizeBytes = 64 * 1024,
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const rawContentLength = req.headers["content-length"];
+    if (rawContentLength !== undefined) {
+      const contentLength = parseInt(rawContentLength, 10);
+      if (!Number.isNaN(contentLength) && contentLength > maxSizeBytes) {
+        req.resume();
+        return reject(new SecurityError("Payload too large", 413));
+      }
+    }
+
+    let body = "";
+    let receivedBytes = 0;
+    let settled = false;
+
+    req.setEncoding("utf8");
+
+    req.on("data", (chunk: string) => {
+      if (settled) return;
+      receivedBytes += Buffer.byteLength(chunk, "utf8");
+      if (receivedBytes > maxSizeBytes) {
+        settled = true;
+        req.pause();
+        return reject(new SecurityError("Payload too large", 413));
+      }
+      body += chunk;
+    });
+
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      if (!body.trim()) {
+        return reject(new SecurityError("Request body is empty", 400));
+      }
+      try {
+        const parsed = JSON.parse(body);
+        resolve(parsed);
+      } catch {
+        reject(new SecurityError("Malformed JSON payload", 400));
+      }
+    });
+
+    req.on("error", () => {
+      if (settled) return;
+      settled = true;
+      reject(new SecurityError("Failed to read request body", 400));
+    });
+  });
+}
+
+export interface HttpHandlerOptions {
+  operationManager?: OperationManager | undefined;
+}
+
+export function createHttpHandler(
+  config: HarnessConfig,
+  harnessRoot: string,
+  options?: HttpHandlerOptions,
+) {
   const dataRoot = path.resolve(harnessRoot, config.dataDirectory);
   const uiRoot = path.resolve(harnessRoot, "ui");
+  const operationManager = options?.operationManager ?? new OperationManager({
+    harnessRoot,
+    dataDirectory: config.dataDirectory,
+  });
 
   return async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const method = req.method?.toUpperCase();
-    if (method !== "GET" && method !== "HEAD") {
-      sendJson(res, 405, { error: "Method not allowed" });
-      return;
-    }
-
     const parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathname = parsedUrl.pathname;
 
     try {
+      if (method === "POST") {
+        if (pathname === "/api/runs" || pathname === "/runs") {
+          const contentType = req.headers["content-type"];
+          const mediaType = contentType ? contentType.split(";")[0]?.trim().toLowerCase() : "";
+          if (mediaType !== "application/json") {
+            throw new UnsupportedMediaTypeError("Content-Type must be application/json");
+          }
+
+          const rawBody = await readBoundedJson(req, 64 * 1024);
+          if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+            throw new SecurityError("Invalid JSON body: expected an object", 400);
+          }
+          const body = rawBody as Record<string, unknown>;
+          const op = await operationManager.startRun(
+            body["repositoryPath"] as string,
+            body["requirement"] as string,
+          );
+          sendJson(res, 201, op);
+          return;
+        }
+
+        const cancelMatch = OPERATION_CANCEL_REGEX.exec(pathname);
+        if (cancelMatch) {
+          let rawId = cancelMatch[1] ?? "";
+          try {
+            rawId = decodeURIComponent(rawId);
+          } catch {
+            throw new SecurityError("Invalid URL encoding in operation id", 400);
+          }
+          assertValidOperationId(rawId);
+          const op = await operationManager.cancelOperation(rawId);
+          sendJson(res, 200, op);
+          return;
+        }
+
+        sendJson(res, 405, { error: "Method not allowed" });
+        return;
+      }
+
+      if (method !== "GET" && method !== "HEAD") {
+        sendJson(res, 405, { error: "Method not allowed" });
+        return;
+      }
+
       // 1. Health
       if (pathname === "/api/health" || pathname === "/health") {
         sendJson(res, 200, { status: "ok" });
         return;
       }
 
-      // 2. List parallel runs
+      // 2. Operations endpoints
+      if (pathname === "/api/operations" || pathname === "/operations") {
+        const ops = await operationManager.getOperations();
+        sendJson(res, 200, ops);
+        return;
+      }
+
+      const opMatch = OPERATION_ITEM_REGEX.exec(pathname);
+      if (opMatch) {
+        let rawId = opMatch[1] ?? "";
+        try {
+          rawId = decodeURIComponent(rawId);
+        } catch {
+          throw new SecurityError("Invalid URL encoding in operation id", 400);
+        }
+        assertValidOperationId(rawId);
+        const op = await operationManager.getOperation(rawId);
+        sendJson(res, 200, op);
+        return;
+      }
+
+      // 3. List parallel runs
       if (
         pathname === "/api/parallel-runs" ||
         pathname === "/api/runs" ||

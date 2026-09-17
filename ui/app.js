@@ -5,16 +5,18 @@
  * No untrusted values are ever assigned to innerHTML.
  */
 
-// Configuration constants
 const POLL_INTERVAL_MS = 3500;
 const RUNS_API = "/api/parallel-runs";
 const HEALTH_API = "/api/health";
+const OPERATIONS_API = "/api/operations";
 
 // Application state
 let runs = [];
+let operations = [];
 let selectedRunId = null;
 let pollTimer = null;
 let isPolling = false;
+let isSubmittingRun = false;
 let consecutiveFailures = 0;
 let lastSelectedDiffText = "";
 
@@ -872,6 +874,7 @@ async function pollRuns() {
     runs = Array.isArray(fetchedRuns) ? fetchedRuns : [];
     updateMetricsBar(runs);
     renderSidebarList();
+    await pollOperations();
 
     // Check if initial or preserved run selection should occur
     if (runs.length > 0) {
@@ -942,6 +945,241 @@ async function copyDiffToClipboard() {
 }
 
 /**
+ * Fetch and render operations
+ */
+async function pollOperations() {
+  try {
+    const ops = await fetchJson(OPERATIONS_API);
+    if (Array.isArray(ops)) {
+      operations = ops;
+      renderOperations();
+    }
+  } catch {
+    // Non-blocking
+  }
+}
+
+/**
+ * Render operations safely using DOM builder
+ */
+function renderOperations() {
+  const card = document.getElementById("operations-card");
+  const container = document.getElementById("operations-container");
+  const countBadge = document.getElementById("operations-count-badge");
+  if (!card || !container) return;
+
+  while (container.firstChild) {
+    container.removeChild(container.firstChild);
+  }
+
+  if (operations.length === 0) {
+    card.classList.add("hidden");
+    return;
+  }
+
+  card.classList.remove("hidden");
+  const activeCount = operations.filter((op) => op.status === "RUNNING").length;
+  if (countBadge) {
+    countBadge.textContent = `${activeCount} active / ${operations.length} total`;
+  }
+
+  for (const op of operations) {
+    const item = el("div", { className: "operation-item", id: `op-item-${op.id}` }, [
+      // Header: ID + State Badge
+      el("div", { className: "operation-header" }, [
+        el("div", { className: "operation-id-wrap" }, [
+          el("span", { className: "code-tag font-mono", textContent: op.id }),
+          el("span", {
+            className: `badge ${getStateBadgeClass(op.status)}`,
+            textContent: op.status,
+          }),
+        ]),
+        el("span", {
+          className: "form-hint font-mono",
+          textContent: op.startedAt ? new Date(op.startedAt).toLocaleTimeString() : "",
+        }),
+      ]),
+
+      // Body: Repo + Requirement + Message
+      el("div", { className: "operation-body" }, [
+        el("div", { className: "operation-repo-line" }, [
+          el("strong", { textContent: "Repo: " }),
+          el("span", { className: "font-mono", textContent: op.repositoryPath }),
+        ]),
+        el("div", { className: "operation-req-text", textContent: op.requirement }),
+        op.message
+          ? el("div", { className: "operation-msg-text font-mono", textContent: op.message })
+          : null,
+      ]),
+
+      // Footer: Linked Run & Cancel Control (shown only for cancellable operations!)
+      el("div", { className: "operation-footer" }, [
+        op.runId
+          ? el("a", {
+              className: "op-run-link font-mono",
+              href: `#run-${op.runId}`,
+              textContent: `Open Run: ${op.runId}`,
+              onClick: (e) => {
+                e.preventDefault();
+                window.location.hash = `#run-${op.runId}`;
+                selectRun(op.runId);
+              },
+            })
+          : el("span", { className: "form-hint", textContent: "Run ID pending..." }),
+
+        // Cancel button: shown ONLY for cancellable operations!
+        op.cancellable
+          ? el("button", {
+              className: "btn btn-danger btn-sm btn-cancel-operation",
+              textContent: "Cancel Run",
+              "aria-label": `Cancel operation ${op.id}`,
+              onClick: () => handleCancelOperation(op.id),
+            })
+          : null,
+      ]),
+    ]);
+
+    container.appendChild(item);
+  }
+}
+
+/**
+ * Handle operation cancellation
+ */
+async function handleCancelOperation(opId) {
+  const btn = document.querySelector(`#op-item-${CSS.escape(opId)} .btn-cancel-operation`);
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Cancelling...";
+  }
+
+  try {
+    const res = await fetch(`/api/operations/${encodeURIComponent(opId)}/cancel`, {
+      method: "POST",
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try {
+        const body = await res.json();
+        if (body?.error) msg = body.error;
+      } catch {}
+      throw new Error(msg);
+    }
+    await pollOperations();
+  } catch (err) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Cancel Run";
+    }
+    showFeedback("form-feedback", `Failed to cancel operation: ${err.message}`, "error");
+  }
+}
+
+/**
+ * Show feedback message safely
+ */
+function showFeedback(elementId, message, type = "success") {
+  const fb = document.getElementById(elementId);
+  if (!fb) return;
+  fb.textContent = message;
+  fb.className = `form-feedback feedback-${type}`;
+  fb.classList.remove("hidden");
+}
+
+function clearFeedback(elementId) {
+  const fb = document.getElementById(elementId);
+  if (!fb) return;
+  fb.textContent = "";
+  fb.className = "form-feedback hidden";
+}
+
+/**
+ * Toggle New Run form visibility
+ */
+function toggleNewRunForm() {
+  const wrap = document.getElementById("new-run-form-wrap");
+  const btn = document.getElementById("btn-collapse-new-run");
+  if (!wrap || !btn) return;
+  const isHidden = wrap.classList.toggle("hidden");
+  btn.setAttribute("aria-expanded", String(!isHidden));
+  btn.textContent = isHidden ? "Show Form" : "Hide Form";
+}
+
+/**
+ * Handle New Run submission
+ */
+async function handleNewRunSubmit(e) {
+  e.preventDefault();
+  if (isSubmittingRun) return;
+
+  const repoInput = document.getElementById("input-repo-path");
+  const reqInput = document.getElementById("input-requirement");
+  const submitBtn = document.getElementById("btn-submit-run");
+
+  const repoPath = repoInput ? repoInput.value.trim() : "";
+  const requirement = reqInput ? reqInput.value.trim() : "";
+
+  if (!repoPath) {
+    showFeedback("form-feedback", "Repository path is required.", "error");
+    repoInput?.focus();
+    return;
+  }
+
+  if (!requirement) {
+    showFeedback("form-feedback", "Requirement is required.", "error");
+    reqInput?.focus();
+    return;
+  }
+
+  clearFeedback("form-feedback");
+  isSubmittingRun = true;
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Starting...";
+  }
+
+  try {
+    const res = await fetch("/api/runs", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ repositoryPath: repoPath, requirement }),
+    });
+
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        const data = await res.json();
+        if (data?.error) detail = data.error;
+      } catch {}
+      throw new Error(detail);
+    }
+
+    const op = await res.json();
+    showFeedback(
+      "form-feedback",
+      `Started operation ${op.id}. Runs use isolated worktrees and never auto-merge the original checkout.`,
+      "success",
+    );
+
+    if (reqInput) reqInput.value = "";
+    await pollOperations();
+    await pollRuns();
+  } catch (err) {
+    showFeedback("form-feedback", `Error: ${err.message}`, "error");
+  } finally {
+    isSubmittingRun = false;
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Start Parallel Run";
+    }
+  }
+}
+
+/**
  * Initialize application events and polling loop
  */
 function init() {
@@ -964,6 +1202,44 @@ function init() {
     });
   }
 
+  // Phase 4C: New Run form and toggle listeners
+  const newRunForm = document.getElementById("new-run-form");
+  if (newRunForm) {
+    newRunForm.addEventListener("submit", handleNewRunSubmit);
+  }
+
+  const collapseBtn = document.getElementById("btn-collapse-new-run");
+  if (collapseBtn) {
+    collapseBtn.addEventListener("click", toggleNewRunForm);
+  }
+
+  const toggleHeaderBtn = document.getElementById("btn-toggle-new-run");
+  if (toggleHeaderBtn) {
+    toggleHeaderBtn.addEventListener("click", () => {
+      const wrap = document.getElementById("new-run-form-wrap");
+      const collapseButton = document.getElementById("btn-collapse-new-run");
+      if (wrap && wrap.classList.contains("hidden")) {
+        wrap.classList.remove("hidden");
+        if (collapseButton) {
+          collapseButton.setAttribute("aria-expanded", "true");
+          collapseButton.textContent = "Hide Form";
+        }
+      }
+      document.getElementById("input-repo-path")?.focus();
+    });
+  }
+
+  const resetBtn = document.getElementById("btn-reset-form");
+  if (resetBtn) {
+    resetBtn.addEventListener("click", () => {
+      const repoInput = document.getElementById("input-repo-path");
+      const reqInput = document.getElementById("input-requirement");
+      if (repoInput) repoInput.value = "";
+      if (reqInput) reqInput.value = "";
+      clearFeedback("form-feedback");
+    });
+  }
+
   // Handle URL hash changes
   window.addEventListener("hashchange", () => {
     const hashMatch = window.location.hash.match(/^#run-([^&]+)/);
@@ -977,6 +1253,7 @@ function init() {
 
   // Initial poll and recurring timer
   pollRuns();
+  pollOperations();
   pollTimer = setInterval(pollRuns, POLL_INTERVAL_MS);
 }
 

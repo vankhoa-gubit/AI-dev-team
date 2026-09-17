@@ -1,12 +1,15 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import type { HarnessConfig } from "../config.js";
+import { OperationManager } from "./operations.js";
 import { createHttpHandler } from "./routes.js";
 import { assertLoopbackHost } from "./security.js";
 
 export interface HarnessUiServerOptions {
   host?: string;
   port?: number;
+  operationManager?: OperationManager;
+  cliScriptPath?: string;
 }
 
 export class HarnessUiServer {
@@ -16,6 +19,7 @@ export class HarnessUiServer {
   private actualPort = 0;
   private readonly config: HarnessConfig;
   private readonly harnessRoot: string;
+  private readonly opManager: OperationManager;
 
   constructor(
     config: HarnessConfig,
@@ -26,7 +30,16 @@ export class HarnessUiServer {
     this.harnessRoot = harnessRoot;
     this.host = options.host ?? "127.0.0.1";
     this.requestedPort = options.port ?? 4310;
+    this.opManager = options.operationManager ?? new OperationManager({
+      harnessRoot,
+      dataDirectory: config.dataDirectory,
+      cliScriptPath: options.cliScriptPath,
+    });
     assertLoopbackHost(this.host);
+  }
+
+  get operationManager(): OperationManager {
+    return this.opManager;
   }
 
   async start(): Promise<void> {
@@ -35,7 +48,9 @@ export class HarnessUiServer {
       throw new Error("Server is already running");
     }
 
-    const handler = createHttpHandler(this.config, this.harnessRoot);
+    const handler = createHttpHandler(this.config, this.harnessRoot, {
+      operationManager: this.opManager,
+    });
 
     return new Promise((resolve, reject) => {
       const srv = http.createServer((req, res) => {

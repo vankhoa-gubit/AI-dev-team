@@ -18,6 +18,22 @@ export class NotFoundError extends Error {
   }
 }
 
+export class ConflictError extends Error {
+  readonly statusCode = 409;
+  constructor(message = "Conflict") {
+    super(message);
+    this.name = "ConflictError";
+  }
+}
+
+export class UnsupportedMediaTypeError extends Error {
+  readonly statusCode = 415;
+  constructor(message = "Unsupported Media Type") {
+    super(message);
+    this.name = "UnsupportedMediaTypeError";
+  }
+}
+
 export function isLoopbackHost(host: string): boolean {
   if (!host || typeof host !== "string") return false;
   const trimmed = host.trim().toLowerCase();
@@ -78,6 +94,22 @@ export function assertValidRunId(id: string): void {
   }
 }
 
+const OPERATION_ID_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}$/;
+
+export function isValidOperationId(id: string): boolean {
+  if (!id || typeof id !== "string") return false;
+  if (id.includes(".") || id.includes("/") || id.includes("\\") || id.includes("\0")) {
+    return false;
+  }
+  return OPERATION_ID_REGEX.test(id);
+}
+
+export function assertValidOperationId(id: string): void {
+  if (!isValidOperationId(id)) {
+    throw new SecurityError("Invalid operation id: must be alphanumeric with dashes or underscores", 400);
+  }
+}
+
 export async function assertSafeChildPath(baseDir: string, relativeOrChildPath: string): Promise<string> {
   const resolvedBase = path.resolve(baseDir);
   const resolvedTarget = path.resolve(resolvedBase, relativeOrChildPath);
@@ -110,6 +142,12 @@ export function sanitizeErrorMessage(error: unknown): { message: string; statusC
   }
   if (error instanceof NotFoundError) {
     return { message: error.message, statusCode: 404 };
+  }
+  if (error instanceof ConflictError) {
+    return { message: error.message, statusCode: 409 };
+  }
+  if (error instanceof UnsupportedMediaTypeError) {
+    return { message: error.message, statusCode: 415 };
   }
 
   // Unknown or internal error: never leak stack trace or internal filesystem details

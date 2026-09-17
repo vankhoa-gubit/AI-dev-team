@@ -1089,3 +1089,232 @@ body {
     gap: 0.2rem;
   }
 }
+
+/* Phase 4C: New Run Form and Operations Console */
+.new-run-card {
+  margin-bottom: 1rem;
+  border-left: 3px solid var(--accent-cyan, #00d4ff);
+}
+
+.new-run-header-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.safety-notice {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  background: rgba(0, 212, 255, 0.06);
+  border: 1px solid rgba(0, 212, 255, 0.25);
+  border-radius: var(--radius-sm);
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 0.8rem;
+  font-size: 0.8rem;
+  color: var(--text-primary);
+}
+
+.safety-icon {
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+.safety-text {
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.new-run-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.form-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.required-star {
+  color: var(--status-red, #ff5370);
+}
+
+.form-input,
+.form-textarea {
+  background: var(--bg-canvas, #090d13);
+  border: 1px solid var(--border-primary, #1e2638);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary, #e6edf3);
+  font-size: 0.82rem;
+  padding: 0.5rem 0.65rem;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  width: 100%;
+}
+
+.form-input:focus,
+.form-textarea:focus {
+  border-color: var(--accent-cyan, #00d4ff);
+  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.2);
+}
+
+.form-textarea {
+  resize: vertical;
+  min-height: 70px;
+  line-height: 1.4;
+}
+
+.form-hint {
+  font-size: 0.7rem;
+  color: var(--text-muted, #7d8590);
+}
+
+.form-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.25rem;
+}
+
+.form-feedback {
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  margin-top: 0.4rem;
+}
+
+.form-feedback.feedback-success {
+  background: rgba(46, 160, 67, 0.15);
+  border: 1px solid rgba(46, 160, 67, 0.4);
+  color: #3fb950;
+}
+
+.form-feedback.feedback-error {
+  background: rgba(248, 81, 73, 0.15);
+  border: 1px solid rgba(248, 81, 73, 0.4);
+  color: #ff7b72;
+}
+
+/* Operations Console */
+.operations-card {
+  margin-bottom: 1rem;
+  border-left: 3px solid var(--status-amber, #d29922);
+}
+
+.operations-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.operations-hint {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.operations-container {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.5rem;
+}
+
+.operation-item {
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-secondary);
+  border-radius: var(--radius-sm);
+  padding: 0.7rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.operation-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.operation-id-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.operation-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+}
+
+.operation-repo-line {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.operation-req-text {
+  color: var(--text-primary);
+  line-height: 1.35;
+  font-style: italic;
+}
+
+.operation-msg-text {
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  background: rgba(255, 255, 255, 0.02);
+  padding: 0.25rem 0.45rem;
+  border-radius: var(--radius-sm);
+}
+
+.operation-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.2rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--border-secondary);
+}
+
+.op-run-link {
+  font-size: 0.75rem;
+  color: var(--accent-cyan);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.op-run-link:hover {
+  color: #fff;
+}
+
+.btn-danger {
+  background: rgba(248, 81, 73, 0.15);
+  border: 1px solid rgba(248, 81, 73, 0.4);
+  color: #ff7b72;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: rgba(248, 81, 73, 0.25);
+  border-color: rgba(248, 81, 73, 0.6);
+  color: #fff;
+}

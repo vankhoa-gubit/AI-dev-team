@@ -46,6 +46,9 @@
           <span id="last-poll-time" class="poll-time">Checking /api/parallel-runs</span>
         </div>
       </div>
+      <button id="btn-toggle-new-run" class="btn btn-primary" aria-label="Toggle New Run form" title="Start a new parallel run">
+        + New Run
+      </button>
       <button id="btn-refresh" class="btn btn-secondary" aria-label="Refresh run list and details" title="Refresh run data now">
         Refresh
       </button>
@@ -79,6 +82,90 @@
 
     <main id="main-content" class="main-content" role="main" tabindex="-1">
       <div id="global-alert" class="alert-banner hidden" role="alert" aria-live="assertive"></div>
+
+      <!-- New Parallel Run Card (Phase 4C) -->
+      <section id="new-run-section" class="card new-run-card" aria-labelledby="new-run-heading">
+        <div class="section-header-row">
+          <div class="new-run-header-title">
+            <h2 id="new-run-heading" class="section-heading">Start Parallel Run</h2>
+            <span class="badge badge-neutral">Phase 4C</span>
+          </div>
+          <button id="btn-collapse-new-run" class="btn btn-secondary btn-sm" aria-expanded="true" aria-controls="new-run-form-wrap">
+            Hide Form
+          </button>
+        </div>
+
+        <div id="new-run-form-wrap" class="new-run-form-wrap">
+          <div class="safety-notice" role="note" aria-label="Harness safety guarantee">
+            <span class="safety-icon" aria-hidden="true">&#x1F6E1;</span>
+            <span class="safety-text">Runs use isolated worktrees and never auto-merge the original checkout.</span>
+          </div>
+
+          <form id="new-run-form" class="new-run-form" novalidate>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="input-repo-path" class="form-label">
+                  Repository Path <span class="required-star" aria-hidden="true">*</span>
+                </label>
+                <input
+                  type="text"
+                  id="input-repo-path"
+                  name="repositoryPath"
+                  class="form-input font-mono"
+                  placeholder="D:\path\to\git-repo or /path/to/git-repo"
+                  required
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-describedby="repo-path-hint"
+                >
+                <span id="repo-path-hint" class="form-hint">Absolute filesystem path to an existing local Git repository.</span>
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label for="input-requirement" class="form-label">
+                  Requirement <span class="required-star" aria-hidden="true">*</span>
+                </label>
+                <textarea
+                  id="input-requirement"
+                  name="requirement"
+                  class="form-textarea"
+                  rows="3"
+                  placeholder="Describe the feature, bugfix, or task to execute across parallel shards..."
+                  required
+                  spellcheck="false"
+                  aria-describedby="requirement-hint"
+                ></textarea>
+                <span id="requirement-hint" class="form-hint">Bounded requirement text for Codex planning, Antigravity workers, and integration review.</span>
+              </div>
+            </div>
+
+            <div class="form-actions-row">
+              <button type="submit" id="btn-submit-run" class="btn btn-primary">
+                Start Parallel Run
+              </button>
+              <button type="button" id="btn-reset-form" class="btn btn-secondary">
+                Clear
+              </button>
+            </div>
+
+            <div id="form-feedback" class="form-feedback hidden" role="status" aria-live="polite"></div>
+          </form>
+        </div>
+      </section>
+
+      <!-- Active Operations Card (Phase 4C) -->
+      <section id="operations-card" class="card operations-card hidden" aria-labelledby="operations-heading">
+        <div class="section-header-row">
+          <div class="operations-title-wrap">
+            <h2 id="operations-heading" class="section-heading">Active Operations</h2>
+            <span id="operations-count-badge" class="count-badge">0 active</span>
+          </div>
+          <span class="operations-hint">Monitored local runs</span>
+        </div>
+        <div id="operations-container" class="operations-container" role="region" aria-label="List of run operations"></div>
+      </section>
 
       <div id="empty-state" class="empty-view">
         <div class="empty-card">
