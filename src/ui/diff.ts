@@ -1,7 +1,6 @@
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { runProcess } from "../process.js";
-import type { ParallelRunSummary } from "../parallel-types.js";
 
 export const DEFAULT_MAX_DIFF_BYTES = 256 * 1024; // 256 KB
 export const DEFAULT_MAX_DIFF_LINES = 2000;
@@ -52,6 +51,35 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
+function isValidGitRef(ref: unknown): ref is string {
+  return (
+    typeof ref === "string" &&
+    ref.length >= 1 &&
+    ref.length <= 128 &&
+    /^[a-zA-Z0-9._~^/-]+$/.test(ref) &&
+    !ref.startsWith("-")
+  );
+}
+
+export async function getValidatedChildWorktree(
+  parentDir: string,
+  candidateChild: string,
+): Promise<string | null> {
+  try {
+    const realParent = await realpath(path.resolve(parentDir));
+    const resolvedCandidate = path.resolve(parentDir, candidateChild);
+    const realChild = await realpath(resolvedCandidate);
+
+    const rel = path.relative(realParent, realChild);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+      return null;
+    }
+    return realChild;
+  } catch {
+    return null;
+  }
+}
+
 export async function getBoundedIntegrationDiff(
   runDirectory: string,
   options: { maxBytes?: number; maxLines?: number } = {},
@@ -74,47 +102,59 @@ export async function getBoundedIntegrationDiff(
     return null;
   }
 
-  let summary: ParallelRunSummary;
+  let statusData: unknown;
   try {
     const raw = await readFile(statusPath, "utf8");
-    summary = JSON.parse(raw);
+    statusData = JSON.parse(raw);
   } catch {
     return null;
   }
 
-  const { repositoryPath, baseSha, integrationCommitSha, integrationWorktreePath } = summary;
-
-  // 3. Try running git diff in the integration worktree if it exists
-  if (integrationWorktreePath && (await pathExists(integrationWorktreePath))) {
-    const args = baseSha
-      ? (integrationCommitSha ? ["diff", baseSha, integrationCommitSha] : ["diff", baseSha])
-      : ["diff", "HEAD~1"];
-    try {
-      const result = await runProcess("git", args, {
-        cwd: integrationWorktreePath,
-        timeoutMs: 15_000,
-      });
-      if (result.exitCode === 0) {
-        return boundDiff(result.stdout, maxBytes, maxLines);
-      }
-    } catch {
-      // Fall through
-    }
+  if (!statusData || typeof statusData !== "object") {
+    return null;
   }
 
-  // 4. Try running git diff in the main repository if commits exist
-  if (repositoryPath && (await pathExists(repositoryPath)) && baseSha && integrationCommitSha) {
-    try {
-      const result = await runProcess("git", ["diff", baseSha, integrationCommitSha], {
-        cwd: repositoryPath,
-        timeoutMs: 15_000,
-      });
-      if (result.exitCode === 0) {
-        return boundDiff(result.stdout, maxBytes, maxLines);
-      }
-    } catch {
-      // Fall through
+  const { baseSha, integrationCommitSha, integrationWorktreePath } = statusData as {
+    baseSha?: unknown;
+    integrationCommitSha?: unknown;
+    integrationWorktreePath?: unknown;
+  };
+
+  // 3. Try running git diff in the integration worktree ONLY if it exists and is a real child of runDirectory
+  if (typeof integrationWorktreePath !== "string" || !integrationWorktreePath.trim()) {
+    return null;
+  }
+
+  const validatedWorktree = await getValidatedChildWorktree(runDirectory, integrationWorktreePath);
+  if (!validatedWorktree) {
+    return null;
+  }
+
+  // Treat ref fields as untrusted
+  if (baseSha !== undefined && !isValidGitRef(baseSha)) {
+    return null;
+  }
+  if (integrationCommitSha !== undefined && !isValidGitRef(integrationCommitSha)) {
+    return null;
+  }
+
+  const validBase = isValidGitRef(baseSha) ? baseSha : undefined;
+  const validIntegration = isValidGitRef(integrationCommitSha) ? integrationCommitSha : undefined;
+
+  const args = validBase
+    ? (validIntegration ? ["diff", validBase, validIntegration] : ["diff", validBase])
+    : ["diff", "HEAD~1"];
+
+  try {
+    const result = await runProcess("git", args, {
+      cwd: validatedWorktree,
+      timeoutMs: 15_000,
+    });
+    if (result.exitCode === 0) {
+      return boundDiff(result.stdout, maxBytes, maxLines);
     }
+  } catch {
+    // Fall through
   }
 
   return null;

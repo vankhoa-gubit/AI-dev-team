@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { parsePort } from "../src/cli.js";
 import type { HarnessConfig } from "../src/config.js";
 import type { ParallelRunSummary } from "../src/parallel-types.js";
 import type { CheckResult, ReviewResult } from "../src/types.js";
@@ -10,6 +12,7 @@ import {
   assertLoopbackHost,
   assertValidRunId,
   boundDiff,
+  getBoundedIntegrationDiff,
   HarnessUiServer,
   isLoopbackHost,
   isValidRunId,
@@ -29,6 +32,41 @@ function testConfig(dataDirectory = ".harness"): HarnessConfig {
     },
     parallel: { maxWorkers: 2, maxTasks: 4 },
   };
+}
+
+function rawHttpRequest(
+  port: number,
+  requestPath: string,
+  method = "GET",
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        path: requestPath,
+        method,
+        headers: { Connection: "close" },
+        agent: false,
+      },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk: string) => {
+          body += chunk;
+        });
+        res.on("end", () => {
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            body,
+          });
+        });
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
 }
 
 test("loopback binding validation accepts local addresses and rejects external hosts", () => {
@@ -72,9 +110,10 @@ test("run ID validation rejects path traversal and special characters", () => {
 
 test("server lifecycle: start, ephemeral port, stop, and double-start protection", async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "harness-lifecycle-"));
+  let server: HarnessUiServer | undefined;
   try {
     const config = testConfig();
-    const server = new HarnessUiServer(config, tempRoot, { host: "127.0.0.1", port: 0 });
+    server = new HarnessUiServer(config, tempRoot, { host: "127.0.0.1", port: 0 });
 
     assert.equal(server.listening, false);
     await server.start();
@@ -83,7 +122,7 @@ test("server lifecycle: start, ephemeral port, stop, and double-start protection
     assert.ok(server.url.startsWith("http://127.0.0.1:"));
 
     // Double start should reject
-    await assert.rejects(() => server.start(), /already running/);
+    await assert.rejects(() => server!.start(), /already running/);
 
     // Endpoint works
     const res = await fetch(`${server.url}/api/health`);
@@ -96,16 +135,20 @@ test("server lifecycle: start, ephemeral port, stop, and double-start protection
     assert.equal(server.listening, false);
 
     // After stop, connection should fail
-    await assert.rejects(() => fetch(`${server.url}/api/health`));
+    await assert.rejects(() => fetch(`${server!.url}/api/health`));
   } finally {
+    if (server) {
+      await server.stop();
+    }
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
 
 test("health endpoints: GET /api/health and /health", async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "harness-health-"));
+  let server: HarnessUiServer | undefined;
   try {
-    const server = new HarnessUiServer(testConfig(), tempRoot, { host: "127.0.0.1", port: 0 });
+    server = new HarnessUiServer(testConfig(), tempRoot, { host: "127.0.0.1", port: 0 });
     await server.start();
 
     const apiRes = await fetch(`${server.url}/api/health`);
@@ -115,15 +158,17 @@ test("health endpoints: GET /api/health and /health", async () => {
     const rootRes = await fetch(`${server.url}/health`);
     assert.equal(rootRes.status, 200);
     assert.deepEqual(await rootRes.json(), { status: "ok" });
-
-    await server.stop();
   } finally {
+    if (server) {
+      await server.stop();
+    }
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
 
 test("list parallel runs: returns newest-first and sanitizes raw process stdout/stderr", async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "harness-runs-list-"));
+  let server: HarnessUiServer | undefined;
   try {
     const runsDir = path.join(tempRoot, ".harness", "parallel-runs");
     const run1 = path.join(runsDir, "parallel-20260917100000-aaaa1111");
@@ -174,7 +219,7 @@ test("list parallel runs: returns newest-first and sanitizes raw process stdout/
     await writeFile(path.join(run1, "status.json"), JSON.stringify(summary1), "utf8");
     await writeFile(path.join(run2, "status.json"), JSON.stringify(summary2), "utf8");
 
-    const server = new HarnessUiServer(testConfig(), tempRoot, { host: "127.0.0.1", port: 0 });
+    server = new HarnessUiServer(testConfig(), tempRoot, { host: "127.0.0.1", port: 0 });
     await server.start();
 
     const res = await fetch(`${server.url}/api/parallel-runs`);
@@ -194,15 +239,17 @@ test("list parallel runs: returns newest-first and sanitizes raw process stdout/
     assert.equal(check.passed, true);
     assert.equal(check.stdout, undefined);
     assert.equal(check.stderr, undefined);
-
-    await server.stop();
   } finally {
+    if (server) {
+      await server.stop();
+    }
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
 
 test("run status, events, review, checks, and diff endpoints", async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "harness-detail-"));
+  let server: HarnessUiServer | undefined;
   try {
     const runId = "parallel-20260917140000-cccc3333";
     const runDir = path.join(tempRoot, ".harness", "parallel-runs", runId);
@@ -256,7 +303,7 @@ test("run status, events, review, checks, and diff endpoints", async () => {
     const patch = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n";
     await writeFile(path.join(runDir, "integration-diff.patch"), patch, "utf8");
 
-    const server = new HarnessUiServer(testConfig(), tempRoot, { host: "127.0.0.1", port: 0 });
+    server = new HarnessUiServer(testConfig(), tempRoot, { host: "127.0.0.1", port: 0 });
     await server.start();
 
     // 1. Status
@@ -303,9 +350,10 @@ test("run status, events, review, checks, and diff endpoints", async () => {
     assert.equal(diffTextRes.status, 200);
     const diffText = await diffTextRes.text();
     assert.ok(diffText.includes("+new"));
-
-    await server.stop();
   } finally {
+    if (server) {
+      await server.stop();
+    }
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
@@ -321,6 +369,7 @@ test("diff bounding truncates large diffs cleanly", () => {
 
 test("traversal and symlink rejection returns safe JSON error responses", async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "harness-security-"));
+  let server: HarnessUiServer | undefined;
   try {
     const dataDir = path.join(tempRoot, ".harness", "parallel-runs");
     await mkdir(dataDir, { recursive: true });
@@ -339,51 +388,86 @@ test("traversal and symlink rejection returns safe JSON error responses", async 
       // Symlinks may require special privileges on some Windows configurations; skip symlink creation if not allowed
     }
 
-    const server = new HarnessUiServer(testConfig(), tempRoot, { host: "127.0.0.1", port: 0 });
+    server = new HarnessUiServer(testConfig(), tempRoot, { host: "127.0.0.1", port: 0 });
     await server.start();
 
     if (symlinkCreated) {
       const symlinkRes = await fetch(`${server.url}/api/parallel-runs/symlink-escape`);
       assert.equal(symlinkRes.status, 403);
-      const symlinkJson = await symlinkRes.json();
+      const symlinkJson = (await symlinkRes.json()) as { error?: string; stack?: unknown };
       assert.ok(symlinkJson.error);
+      assert.equal(symlinkJson.stack, undefined);
     }
 
-    // 1. Direct path traversal in run ID
-    const traversalRes = await fetch(`${server.url}/api/parallel-runs/..%2f..%2fsecret.key`);
-    assert.equal(traversalRes.status, 400);
-    const traversalJson = await traversalRes.json();
-    assert.ok(traversalJson.error);
-    assert.equal(traversalJson.stack, undefined);
-    assert.equal(traversalJson.error.includes("TOP_SECRET"), false);
+    // 1. Client-side URL normalization in standard fetch:
+    // Standards-compliant clients normalize relative path segments before sending over the wire.
+    const normalizedRunRes = await fetch(`${server.url}/api/parallel-runs/..`);
+    // fetch normalizes /api/parallel-runs/.. to /api, which returns 404 (or 400 if client did not normalize)
+    assert.ok(normalizedRunRes.status === 404 || normalizedRunRes.status === 400);
+    const normalizedRunJson = (await normalizedRunRes.json()) as { error?: string; stack?: unknown };
+    assert.ok(normalizedRunJson.error);
+    assert.equal(normalizedRunJson.stack, undefined);
+    assert.equal(JSON.stringify(normalizedRunJson).includes("TOP_SECRET"), false);
 
-    // 2. Relative traversal
-    const dotRes = await fetch(`${server.url}/api/parallel-runs/..`);
-    assert.equal(dotRes.status, 400);
-
-    // 3. Traversal in static file request
     const staticTraversalRes = await fetch(`${server.url}/../../secret.key`);
+    // fetch normalizes /../../secret.key to /secret.key, returning 404
     assert.ok(staticTraversalRes.status === 400 || staticTraversalRes.status === 404);
-    const staticJson = await staticTraversalRes.json();
+    const staticJson = (await staticTraversalRes.json()) as { error?: string; stack?: unknown };
     assert.ok(staticJson.error);
     assert.equal(staticJson.stack, undefined);
+    assert.equal(JSON.stringify(staticJson).includes("TOP_SECRET"), false);
+
+    // 2. Encoded traversal via fetch (client may normalize or reroute before server validation)
+    const encodedTraversalRes = await fetch(`${server.url}/api/parallel-runs/..%2f..%2fsecret.key`);
+    assert.ok(encodedTraversalRes.status === 400 || encodedTraversalRes.status === 404);
+    const encodedTraversalJson = (await encodedTraversalRes.json()) as { error?: string; stack?: unknown };
+    assert.ok(encodedTraversalJson.error);
+    assert.equal(encodedTraversalJson.stack, undefined);
+    assert.equal(JSON.stringify(encodedTraversalJson).includes("TOP_SECRET"), false);
+
+    // 3. Raw HTTP requests to exercise encoded and unnormalized traversal without client-side normalization
+    // 3a. Encoded dot traversal in run ID (%2e%2e)
+    const rawDotRes = await rawHttpRequest(server.port, "/api/parallel-runs/%2e%2e");
+    assert.ok(rawDotRes.status === 400 || rawDotRes.status === 404);
+    const rawDotJson = JSON.parse(rawDotRes.body) as { error?: string; stack?: unknown };
+    assert.ok(rawDotJson.error);
+    assert.equal(rawDotJson.stack, undefined);
+    assert.equal(rawDotRes.body.includes("TOP_SECRET"), false);
+
+    // 3b. Encoded path traversal in run ID (..%2f..%2fsecret.key)
+    const rawRunTraversalRes = await rawHttpRequest(server.port, "/api/parallel-runs/..%2f..%2fsecret.key");
+    assert.equal(rawRunTraversalRes.status, 400);
+    const rawRunTraversalJson = JSON.parse(rawRunTraversalRes.body) as { error?: string; stack?: unknown };
+    assert.ok(rawRunTraversalJson.error);
+    assert.equal(rawRunTraversalJson.stack, undefined);
+    assert.equal(rawRunTraversalRes.body.includes("TOP_SECRET"), false);
+
+    // 3c. Encoded path traversal in static file request (/..%2fsecret.key)
+    const rawStaticTraversalRes = await rawHttpRequest(server.port, "/..%2fsecret.key");
+    assert.ok(rawStaticTraversalRes.status === 400 || rawStaticTraversalRes.status === 404);
+    const rawStaticJson = JSON.parse(rawStaticTraversalRes.body) as { error?: string; stack?: unknown };
+    assert.ok(rawStaticJson.error);
+    assert.equal(rawStaticJson.stack, undefined);
+    assert.equal(rawStaticTraversalRes.body.includes("TOP_SECRET"), false);
 
     // 4. Method not allowed
     const postRes = await fetch(`${server.url}/api/parallel-runs`, { method: "POST" });
     assert.equal(postRes.status, 405);
-    const postJson = await postRes.json();
+    const postJson = (await postRes.json()) as { error?: string };
     assert.equal(postJson.error, "Method not allowed");
-
-    await server.stop();
   } finally {
+    if (server) {
+      await server.stop();
+    }
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
 
 test("static file serving serves repository ui directory with safe fallback when missing", async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "harness-static-"));
+  let server: HarnessUiServer | undefined;
   try {
-    const server = new HarnessUiServer(testConfig(), tempRoot, { host: "127.0.0.1", port: 0 });
+    server = new HarnessUiServer(testConfig(), tempRoot, { host: "127.0.0.1", port: 0 });
     await server.start();
 
     // 1. When ui/ does not exist, GET / serves fallback HTML
@@ -412,10 +496,119 @@ test("static file serving serves repository ui directory with safe fallback when
     // Missing asset returns 404 JSON
     const missingRes = await fetch(`${server.url}/missing.js`);
     assert.equal(missingRes.status, 404);
-    const missingJson = await missingRes.json();
+    const missingJson = (await missingRes.json()) as { error?: string };
     assert.equal(missingJson.error, "Not found");
+  } finally {
+    if (server) {
+      await server.stop();
+    }
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
 
-    await server.stop();
+test("cli parsePort strictly validates port numbers", () => {
+  // Valid ports
+  assert.equal(parsePort("4310"), 4310);
+  assert.equal(parsePort("0"), 0);
+  assert.equal(parsePort("80"), 80);
+  assert.equal(parsePort("65535"), 65535);
+  assert.equal(parsePort(undefined), 4310);
+
+  // Rejects trailing characters
+  assert.equal(parsePort("8080abc"), null);
+  assert.equal(parsePort("4310 "), null);
+  assert.equal(parsePort(" 4310"), null);
+  assert.equal(parsePort("4310p"), null);
+
+  // Rejects fractions
+  assert.equal(parsePort("80.5"), null);
+  assert.equal(parsePort("0.0"), null);
+  assert.equal(parsePort("4310.00"), null);
+
+  // Rejects negatives
+  assert.equal(parsePort("-1"), null);
+  assert.equal(parsePort("-4310"), null);
+
+  // Rejects values above 65535
+  assert.equal(parsePort("65536"), null);
+  assert.equal(parsePort("99999"), null);
+  assert.equal(parsePort("1000000"), null);
+
+  // Rejects empty / non-numeric
+  assert.equal(parsePort(""), null);
+  assert.equal(parsePort("abc"), null);
+  assert.equal(parsePort("NaN"), null);
+});
+
+test("getBoundedIntegrationDiff rejects worktrees outside run directory and ignores repositoryPath fallback", async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "harness-diff-security-"));
+  try {
+    const runDir = path.join(tempRoot, "run-1");
+    const externalDir = path.join(tempRoot, "external-repo");
+    await mkdir(runDir, { recursive: true });
+    await mkdir(externalDir, { recursive: true });
+
+    // 1. status.json with integrationWorktreePath outside runDirectory
+    const summaryEscapingWorktree = {
+      id: "run-1",
+      state: "DONE",
+      message: "Done",
+      repositoryPath: externalDir,
+      baseSha: "abc123",
+      integrationCommitSha: "def456",
+      integrationWorktreePath: externalDir,
+    };
+    await writeFile(path.join(runDir, "status.json"), JSON.stringify(summaryEscapingWorktree), "utf8");
+
+    // Must return null without executing git on external directory
+    const diff1 = await getBoundedIntegrationDiff(runDir);
+    assert.equal(diff1, null);
+
+    // 2. status.json with relative path traversal in integrationWorktreePath
+    const summaryTraversal = {
+      id: "run-1",
+      state: "DONE",
+      message: "Done",
+      baseSha: "abc123",
+      integrationWorktreePath: "../external-repo",
+    };
+    await writeFile(path.join(runDir, "status.json"), JSON.stringify(summaryTraversal), "utf8");
+    const diff2 = await getBoundedIntegrationDiff(runDir);
+    assert.equal(diff2, null);
+
+    // 3. status.json with repositoryPath fallback only (no integrationWorktreePath)
+    // The unsafe fallback must be removed, so this must return null
+    const summaryFallbackOnly = {
+      id: "run-1",
+      state: "DONE",
+      message: "Done",
+      repositoryPath: externalDir,
+      baseSha: "abc123",
+      integrationCommitSha: "def456",
+    };
+    await writeFile(path.join(runDir, "status.json"), JSON.stringify(summaryFallbackOnly), "utf8");
+    const diff3 = await getBoundedIntegrationDiff(runDir);
+    assert.equal(diff3, null);
+
+    // 4. Malicious baseSha in status.json
+    const validChildWorktree = path.join(runDir, "integration-worktree");
+    await mkdir(validChildWorktree, { recursive: true });
+    const summaryBadSha = {
+      id: "run-1",
+      state: "DONE",
+      message: "Done",
+      baseSha: "--output=/escape",
+      integrationWorktreePath: validChildWorktree,
+    };
+    await writeFile(path.join(runDir, "status.json"), JSON.stringify(summaryBadSha), "utf8");
+    const diff4 = await getBoundedIntegrationDiff(runDir);
+    assert.equal(diff4, null);
+
+    // 5. Standalone patch file still works as primary source
+    await writeFile(path.join(runDir, "integration-diff.patch"), "--- a\n+++ b\n+hello\n", "utf8");
+    const diff5 = await getBoundedIntegrationDiff(runDir);
+    assert.ok(diff5);
+    assert.ok(diff5.diff.includes("+hello"));
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }

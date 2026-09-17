@@ -1,7 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
 import type { ServerResponse } from "node:http";
 import path from "node:path";
-import { assertSafeChildPath } from "./security.js";
+import { assertSafeChildPath, SecurityError } from "./security.js";
 
 const MIME_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -71,7 +71,10 @@ export async function serveStatic(
   let targetPath: string;
   try {
     targetPath = await assertSafeChildPath(uiRoot, relative);
-  } catch {
+  } catch (err) {
+    if (err instanceof SecurityError) {
+      throw err;
+    }
     return false;
   }
 

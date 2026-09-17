@@ -313,7 +313,7 @@ export function createHttpHandler(config: HarnessConfig, harnessRoot: string) {
       }
 
       // 4. API 404 catch-all
-      if (pathname.startsWith("/api/")) {
+      if (pathname === "/api" || pathname.startsWith("/api/")) {
         throw new NotFoundError("API endpoint not found");
       }
 
