@@ -1,10 +1,12 @@
-# AI Dev Team Harness — Phases 1–3
+# AI Dev Team Harness — Phases 1–4A
 
 Sequential local-first orchestration with Codex as leader and independent reviewer, Antigravity CLI as the implementation worker, and 9Router as the Codex model gateway.
 
 Phase 2 adds a local stdio MCP server so Codex can delegate to Antigravity interactively without a separate harness command.
 
 Phase 3 adds bounded parallel execution with disjoint worker scopes, per-shard review, sequential integration, and a final integration review.
+
+Phase 4A adds a secure local read-only HTTP observation API and `harness ui` CLI entrypoint.
 
 ## Phase 1 flow
 
@@ -112,6 +114,34 @@ The Codex leader must produce at least two tasks with non-overlapping `allowed_p
 Approved shard commits are applied in plan order with `git cherry-pick --no-commit` to a new integration worktree. The combined diff then passes all unique shard checks, integration checks, and a final Codex review. Only after final approval does the harness commit the integration branch. It never merges that branch into the user's checkout.
 
 Conflicts, integrated validation failures, and final-review rejection end in `REPLAN_REQUIRED`. Artifacts remain under `.harness/parallel-runs/<run-id>` for Codex or a human to inspect and replan.
+
+## Phase 4A: local HTTP observation API
+
+Start the local read-only observation server:
+
+```powershell
+node .\dist\cli.js ui [--host 127.0.0.1] [--port 4310] [--config harness.config.json]
+```
+
+By default, the server binds strictly to `127.0.0.1` on port `4310`. Configuration or arguments attempting to bind to non-loopback addresses are rejected.
+
+### Observation endpoints
+
+- `GET /api/health` (or `/health`): returns `{ "status": "ok" }`.
+- `GET /api/parallel-runs`: returns a newest-first JSON list of parallel run summaries.
+- `GET /api/parallel-runs/:id`: returns status and shard results for a specific run (raw stdout/stderr logs omitted).
+- `GET /api/parallel-runs/:id/events`: returns chronological lifecycle transition events from `events.jsonl`.
+- `GET /api/parallel-runs/:id/integration-review`: returns the structured Codex integration review verdict, findings, and criteria evidence.
+- `GET /api/parallel-runs/:id/integration-checks`: returns integration validation commands and pass/fail results (with stdout/stderr omitted).
+- `GET /api/parallel-runs/:id/integration-diff`: returns a bounded diff (`{ id, diff, truncated }` or plain text with `Accept: text/plain`).
+- `GET /`: serves static assets from `ui/` when present, or a safe HTML fallback dashboard when Phase 4B assets do not exist yet.
+
+### Security guarantees
+
+- **Loopback-only binding**: strictly enforces local loopback (`127.0.0.1`, `localhost`, `::1`). Non-loopback bindings are rejected.
+- **Read-only**: only `GET` and `HEAD` requests are handled; mutating verbs return `405 Method Not Allowed`.
+- **Path traversal and symlink protection**: all run IDs and file access are verified against traversal and symlink escapes.
+- **Information leakage protection**: raw process stdout/stderr logs are omitted, and JSON error responses never leak stack traces or internal secrets.
 
 ## Commands
 

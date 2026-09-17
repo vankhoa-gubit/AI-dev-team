@@ -10,6 +10,7 @@ import { Orchestrator } from "./orchestrator.js";
 import { ParallelOrchestrator } from "./parallel-orchestrator.js";
 import { resolveExecutable } from "./process.js";
 import { checkRouter, codexProviderIsConfigured } from "./router.js";
+import { HarnessUiServer } from "./ui/index.js";
 
 const harnessRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -24,6 +25,7 @@ function usage(): string {
     "  harness doctor [--config <path>]",
     "  harness run --repo <git-repo> --requirement <text> [--config <path>] [--allow-dirty]",
     "  harness parallel --repo <git-repo> --requirement <text> [--config <path>] [--allow-dirty]",
+    "  harness ui [--host <host>] [--port <port>] [--config <path>]",
     "",
     "PowerShell tip: single-quote requirements that contain JSON.",
   ].join("\n");
@@ -116,6 +118,55 @@ async function runCommand(args: string[], configPath: string): Promise<number> {
   return summary.state === "APPROVED" ? 0 : 1;
 }
 
+export function parsePort(portString?: string): number | null {
+  if (portString === undefined) {
+    return 4310;
+  }
+  if (!/^\d+$/.test(portString)) {
+    return null;
+  }
+  const port = Number(portString);
+  if (!Number.isSafeInteger(port) || port < 0 || port > 65535) {
+    return null;
+  }
+  return port;
+}
+
+async function uiCommand(args: string[], configPath: string): Promise<number> {
+  const host = optionValue(args, "--host") ?? "127.0.0.1";
+  const portIndex = args.indexOf("--port");
+  let port = 4310;
+  if (portIndex >= 0) {
+    const portString = args[portIndex + 1];
+    if (portString === undefined) {
+      console.error("Invalid port: must be an integer between 0 and 65535");
+      return 2;
+    }
+    const parsed = parsePort(portString);
+    if (parsed === null) {
+      console.error("Invalid port: must be an integer between 0 and 65535");
+      return 2;
+    }
+    port = parsed;
+  }
+  const config = await loadConfig(configPath);
+  const server = new HarnessUiServer(config, harnessRoot, { host, port });
+  await server.start();
+  console.log(`Harness UI server listening on ${server.url}`);
+
+  await new Promise<void>((resolve) => {
+    const shutdown = async () => {
+      process.off("SIGINT", shutdown);
+      process.off("SIGTERM", shutdown);
+      await server.stop();
+      resolve();
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+  });
+  return 0;
+}
+
 async function main(): Promise<number> {
   const args = process.argv.slice(2);
   const command = args[0];
@@ -129,6 +180,9 @@ async function main(): Promise<number> {
   }
   if (command === "parallel") {
     return await parallelCommand(args.slice(1), configPath);
+  }
+  if (command === "ui") {
+    return await uiCommand(args.slice(1), configPath);
   }
 
   if (command === "show-config") {
