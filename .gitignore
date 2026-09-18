@@ -5,3 +5,25 @@ dist-test/
 .npm-cache/
 .codegraph/
 *.log
+
+# Local tombstones for legacy engines/UI that are deleted from the MCP-first tree.
+/src/adapters/codex.ts
+/src/database.ts
+/src/orchestrator.ts
+/src/parallel-orchestrator.ts
+/src/parallel-types.ts
+/src/router.ts
+/src/state-machine.ts
+/src/ui/
+/tests/core.test.ts
+/tests/ui-actions.test.ts
+/tests/ui-api.test.ts
+/tests/ui-lifecycle-actions.test.ts
+/tests/ui-static.test.ts
+/ui/
+/prompts/leader.md
+/prompts/parallel-leader.md
+/prompts/reviewer.md
+/schemas/leader-plan.schema.json
+/schemas/parallel-plan.schema.json
+/schemas/review-result.schema.json

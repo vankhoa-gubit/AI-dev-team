@@ -7,7 +7,7 @@ export const ValidationCommandSchema = z.object({
 
 export type ValidationCommand = z.infer<typeof ValidationCommandSchema>;
 
-export const LeaderPlanSchema = z.object({
+export const TaskContractSchema = z.object({
   objective: z.string().min(1),
   allowed_paths: z.array(z.string().min(1)).min(1),
   acceptance_criteria: z.array(z.string().min(1)).min(1),
@@ -15,9 +15,9 @@ export const LeaderPlanSchema = z.object({
   worker_instructions: z.string().min(1),
 }).strict();
 
-export type LeaderPlan = z.infer<typeof LeaderPlanSchema>;
+export type TaskContract = z.infer<typeof TaskContractSchema>;
 
-export const TaskSpecSchema = LeaderPlanSchema.extend({
+export const TaskSpecSchema = TaskContractSchema.extend({
   id: z.string().min(1),
   requirement: z.string().min(1),
   repository_path: z.string().min(1),
@@ -40,43 +40,6 @@ export const WorkerResultSchema = z.object({
 
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
 
-export const ReviewFindingSchema = z.object({
-  severity: z.enum(["critical", "high", "medium", "low"]),
-  title: z.string(),
-  detail: z.string(),
-  path: z.string().nullable().optional(),
-  line: z.number().int().positive().nullable().optional(),
-}).strict();
-
-export const ReviewCriterionSchema = z.object({
-  criterion: z.string(),
-  status: z.enum(["passed", "failed", "unclear"]),
-  evidence: z.string(),
-}).strict();
-
-export const ReviewResultSchema = z.object({
-  verdict: z.enum(["approved", "changes_requested"]),
-  summary: z.string(),
-  findings: z.array(ReviewFindingSchema),
-  acceptance_criteria: z.array(ReviewCriterionSchema),
-}).strict();
-
-export type ReviewResult = z.infer<typeof ReviewResultSchema>;
-
-export const JobStateSchema = z.enum([
-  "RECEIVED",
-  "PLANNING",
-  "READY",
-  "WORKER_RUNNING",
-  "CHECKING",
-  "REVIEWING",
-  "REVISION_REQUIRED",
-  "APPROVED",
-  "FAILED",
-]);
-
-export type JobState = z.infer<typeof JobStateSchema>;
-
 export interface ProcessResult {
   command: string;
   args: string[];
@@ -96,19 +59,4 @@ export interface CheckResult extends ProcessResult {
 export interface WorkerRunResult {
   result: WorkerResult;
   process: ProcessResult;
-}
-
-export interface ReviewRunResult {
-  result: ReviewResult;
-  process: ProcessResult;
-}
-
-export interface JobSummary {
-  id: string;
-  state: JobState;
-  branch?: string;
-  worktreePath?: string;
-  taskPath?: string;
-  revisionRound: number;
-  message: string;
 }

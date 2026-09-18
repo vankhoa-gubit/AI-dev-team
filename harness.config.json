@@ -2,27 +2,6 @@
   "dataDirectory": ".harness",
   "maxRevisionRounds": 2,
   "requireCleanRepository": true,
-  "router": {
-    "baseUrl": "http://127.0.0.1:20128/v1",
-    "required": true
-  },
-  "codex": {
-    "command": "codex",
-    "provider": "nine_router",
-    "providerBaseUrl": "http://127.0.0.1:20128/v1",
-    "providerAuth": {
-      "command": "powershell",
-      "args": [
-        "-NoProfile",
-        "-Command",
-        "$taskCodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }; (Get-Content -LiteralPath (Join-Path $taskCodexHome 'secrets\\9router-api-key') -Raw).Trim()"
-      ]
-    },
-    "leaderModel": "cx/gpt-5.6-sol",
-    "reviewerModel": "cx/gpt-5.6-sol-review",
-    "reasoningEffort": "high",
-    "timeoutMs": 1200000
-  },
   "antigravity": {
     "command": "agy",
     "effort": "high",
@@ -49,8 +28,9 @@
       "cargo"
     ]
   },
-  "parallel": {
-    "maxWorkers": 3,
-    "maxTasks": 8
+  "delegation": {
+    "maxConcurrentWorkers": 3,
+    "maxDiffBytes": 262144,
+    "maxDiffLines": 2000
   }
 }

@@ -83,6 +83,25 @@ export async function listChangedFiles(worktreePath: string): Promise<string[]> 
     });
 }
 
+export async function getWorktreeDiff(worktreePath: string, baseRef = "HEAD"): Promise<string> {
+  const tracked = await git(worktreePath, ["diff", "--binary", "--no-ext-diff", baseRef, "--"]);
+  assertProcessSucceeded(tracked, "git diff");
+
+  const untrackedResult = await git(worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"]);
+  assertProcessSucceeded(untrackedResult, "git list untracked files");
+  const parts = [tracked.stdout];
+  for (const file of untrackedResult.stdout.split("\0").filter(Boolean)) {
+    const untracked = await git(worktreePath, [
+      "diff", "--binary", "--no-index", "--", "/dev/null", file,
+    ]);
+    if (untracked.timedOut || (untracked.exitCode !== 0 && untracked.exitCode !== 1)) {
+      assertProcessSucceeded(untracked, `git diff untracked file ${file}`);
+    }
+    parts.push(untracked.stdout);
+  }
+  return parts.filter(Boolean).join("\n");
+}
+
 function globToRegExp(glob: string): RegExp {
   const normalized = glob.replaceAll("\\", "/").replace(/^\.\//, "");
   let source = "^";

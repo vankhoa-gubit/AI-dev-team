@@ -6,6 +6,18 @@
     "declaration": true,
     "sourceMap": true
   },
-  "include": ["src/**/*.ts"],
+  "include": [
+    "src/adapters/antigravity.ts",
+    "src/cli.ts",
+    "src/config.ts",
+    "src/git.ts",
+    "src/interactive-delegation.ts",
+    "src/mcp-server.ts",
+    "src/output.ts",
+    "src/process.ts",
+    "src/scope.ts",
+    "src/types.ts",
+    "src/validation.ts"
+  ],
   "exclude": ["tests", "dist", "dist-test"]
 }

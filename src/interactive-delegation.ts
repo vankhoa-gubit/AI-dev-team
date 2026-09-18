@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import type { Worker } from "./adapters/antigravity.js";
@@ -7,11 +7,15 @@ import type { HarnessConfig } from "./config.js";
 import {
   assertCleanRepository,
   assertGitRepository,
+  commitAll,
   createWorktree,
   findOutOfScopeFiles,
   getHeadSha,
+  getWorktreeDiff,
   listChangedFiles,
 } from "./git.js";
+import { boundText, formatCommand } from "./output.js";
+import { findOverlappingScope } from "./scope.js";
 import {
   TaskSpecSchema,
   ValidationCommandSchema,
@@ -63,17 +67,39 @@ export const DelegationSnapshotSchema = z.object({
   repository_path: z.string(),
   worktree_path: z.string(),
   branch: z.string(),
+  base_sha: z.string().min(1).optional(),
   revision_round: z.number().int().min(0),
   max_revision_rounds: z.number().int().min(0),
+  worker_attempts: z.number().int().min(0).default(0),
+  codex_process_invocations: z.literal(0).default(0),
   message: z.string(),
+  created_at: z.string().optional(),
   updated_at: z.string(),
   changed_files: z.array(z.string()).default([]),
   checks: z.array(CheckEvidenceSchema).default([]),
   worker_result: WorkerResultSchema.optional(),
   revision_feedback: z.string().optional(),
+  commit_sha: z.string().min(1).optional(),
 }).strict();
 
 export type DelegationSnapshot = z.infer<typeof DelegationSnapshotSchema>;
+
+export interface DelegationDiff {
+  worker_id: string;
+  base_sha: string;
+  changed_files: string[];
+  diff: string;
+  truncated: boolean;
+}
+
+export interface CherryPickHandoff {
+  worker_id: string;
+  repository_path: string;
+  branch: string;
+  commit_sha: string;
+  argv: string[];
+  command: string;
+}
 
 interface ActiveDelegation {
   task: TaskSpec;
@@ -85,9 +111,12 @@ interface ActiveDelegation {
 }
 
 export interface InteractiveDelegationApi {
+  list(repositoryPath?: string): Promise<DelegationSnapshot[]>;
   delegate(request: DelegationRequest): Promise<DelegationSnapshot>;
   getStatus(id: string): Promise<DelegationSnapshot>;
   getResult(id: string): Promise<DelegationSnapshot>;
+  getDiff(id: string): Promise<DelegationDiff>;
+  prepareCherryPick(id: string): Promise<CherryPickHandoff>;
   requestRevision(id: string, feedback: string): Promise<DelegationSnapshot>;
   cancel(id: string): Promise<DelegationSnapshot>;
 }
@@ -120,6 +149,15 @@ function assertDelegationId(id: string): void {
   }
 }
 
+async function pathExists(candidate: string): Promise<boolean> {
+  try {
+    await access(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export class InteractiveDelegationService implements InteractiveDelegationApi {
   private readonly active = new Map<string, ActiveDelegation>();
   private readonly delegationsRoot: string;
@@ -132,12 +170,73 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     this.delegationsRoot = path.resolve(harnessRoot, config.dataDirectory, "delegations");
   }
 
+  async initialize(): Promise<void> {
+    await mkdir(this.delegationsRoot, { recursive: true });
+    const entries = await readdir(this.delegationsRoot, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^delegation-[A-Za-z0-9-]+$/.test(entry.name)) continue;
+      try {
+        const snapshot = await this.loadSnapshot(entry.name);
+        if (!isActive(snapshot.state)) continue;
+        const job = await this.loadActiveJob(entry.name);
+        const worktreeAvailable = await pathExists(job.task.worktree_path);
+        await this.update(job, worktreeAvailable
+          ? {
+              state: "WAITING_FOR_REVISION",
+              message: "MCP server restarted during execution; worktree was preserved. Request a revision to resume the worker.",
+              revision_feedback: "Resume after MCP server restart and complete the task.",
+            }
+          : {
+              state: "FAILED",
+              message: "MCP server restarted before the isolated worktree was available.",
+            });
+      } catch {
+        // A corrupt delegation remains on disk for manual diagnosis and does not block the server.
+      }
+    }
+  }
+
+  async list(repositoryPath?: string): Promise<DelegationSnapshot[]> {
+    await mkdir(this.delegationsRoot, { recursive: true });
+    const resolvedRepository = repositoryPath ? path.resolve(repositoryPath) : undefined;
+    const entries = await readdir(this.delegationsRoot, { withFileTypes: true });
+    const snapshots: DelegationSnapshot[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^delegation-[A-Za-z0-9-]+$/.test(entry.name)) continue;
+      try {
+        const snapshot = await this.loadSnapshot(entry.name);
+        if (!resolvedRepository || snapshot.repository_path === resolvedRepository) {
+          snapshots.push(snapshot);
+        }
+      } catch {
+        // Ignore incomplete/corrupt entries while preserving their artifacts on disk.
+      }
+    }
+    return snapshots.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+  }
+
   async delegate(input: DelegationRequest): Promise<DelegationSnapshot> {
     const request = DelegationRequestSchema.parse(input);
     const repositoryPath = path.resolve(request.repository_path);
     await assertGitRepository(repositoryPath);
     if (this.config.requireCleanRepository) {
       await assertCleanRepository(repositoryPath);
+    }
+
+    const running = [...this.active.values()].filter((job) => isActive(job.snapshot.state));
+    if (running.length >= this.config.delegation.maxConcurrentWorkers) {
+      throw new Error(
+        `Concurrent worker limit reached (${this.config.delegation.maxConcurrentWorkers})`,
+      );
+    }
+    for (const job of running) {
+      if (job.task.repository_path !== repositoryPath) continue;
+      const overlap = findOverlappingScope(request.allowed_paths, job.task.allowed_paths);
+      if (overlap) {
+        throw new Error(
+          `Delegation scope overlaps active worker ${job.task.id}: ${overlap.left} and ${overlap.right}`,
+        );
+      }
     }
 
     const id = createDelegationId();
@@ -163,6 +262,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     });
     await writeFile(path.join(jobDirectory, "task.json"), `${JSON.stringify(task, null, 2)}\n`, "utf8");
 
+    const now = new Date().toISOString();
     const snapshot: DelegationSnapshot = {
       id,
       state: "PREPARING",
@@ -170,10 +270,14 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       repository_path: repositoryPath,
       worktree_path: worktreePath,
       branch,
+      base_sha: baseSha,
       revision_round: 0,
       max_revision_rounds: this.config.maxRevisionRounds,
+      worker_attempts: 1,
+      codex_process_invocations: 0,
       message: "Creating isolated Git worktree",
-      updated_at: new Date().toISOString(),
+      created_at: now,
+      updated_at: now,
       changed_files: [],
       checks: [],
     };
@@ -206,6 +310,71 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     return snapshot;
   }
 
+  async getDiff(id: string): Promise<DelegationDiff> {
+    const job = await this.loadActiveJob(id);
+    if (job.snapshot.state === "PREPARING") {
+      throw new Error(`Delegation ${id} does not have a worktree yet`);
+    }
+    const raw = await getWorktreeDiff(job.task.worktree_path, job.task.base_sha);
+    const bounded = boundText(
+      raw,
+      this.config.delegation.maxDiffBytes,
+      this.config.delegation.maxDiffLines,
+    );
+    const liveChangedFiles = await listChangedFiles(job.task.worktree_path);
+    return {
+      worker_id: id,
+      base_sha: job.task.base_sha,
+      changed_files: liveChangedFiles.length > 0 ? liveChangedFiles : job.snapshot.changed_files,
+      diff: bounded.text,
+      truncated: bounded.truncated,
+    };
+  }
+
+  async prepareCherryPick(id: string): Promise<CherryPickHandoff> {
+    const job = await this.loadActiveJob(id);
+    if (job.snapshot.state !== "COMPLETED") {
+      throw new Error(`Delegation ${id} must be COMPLETED before preparing cherry-pick`);
+    }
+
+    let commitSha = job.snapshot.commit_sha;
+    if (!commitSha) {
+      const changedFiles = await listChangedFiles(job.task.worktree_path);
+      const outOfScope = findOutOfScopeFiles(changedFiles, job.task.allowed_paths);
+      if (changedFiles.length === 0) {
+        throw new Error(`Delegation ${id} has no uncommitted changes to hand off`);
+      }
+      if (outOfScope.length > 0) {
+        throw new Error(`Delegation ${id} contains out-of-scope files: ${outOfScope.join(", ")}`);
+      }
+      const checks = await runValidationChecks(
+        job.task.checks,
+        job.task.worktree_path,
+        this.config.validation,
+      );
+      if (checks.some((check) => !check.passed)) {
+        throw new Error(`Validation failed before handoff:\n${formatCheckFailures(checks)}`);
+      }
+      commitSha = await commitAll(job.task.worktree_path, `harness(${id}): approved delegation`);
+      await this.update(job, {
+        commit_sha: commitSha,
+        changed_files: changedFiles,
+        checks: checkEvidence(checks),
+        message: "Worker change committed on its isolated branch; ready for explicit cherry-pick",
+      });
+    }
+
+    const argv = ["git", "-C", job.task.repository_path, "cherry-pick", commitSha];
+    return {
+      worker_id: id,
+      repository_path: job.task.repository_path,
+      branch: job.task.branch,
+      commit_sha: commitSha,
+      argv,
+      command: formatCommand(argv),
+    };
+  }
+
   async requestRevision(id: string, feedback: string): Promise<DelegationSnapshot> {
     if (!feedback.trim()) {
       throw new Error("Revision feedback must not be empty");
@@ -217,11 +386,15 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     if (job.snapshot.revision_round >= job.snapshot.max_revision_rounds) {
       throw new Error(`Delegation ${id} reached its revision limit`);
     }
+    if (job.snapshot.commit_sha) {
+      throw new Error(`Delegation ${id} is already committed for handoff`);
+    }
 
     job.cancelRequested = false;
     await this.update(job, {
       state: "WORKER_RUNNING",
       revision_round: job.snapshot.revision_round + 1,
+      worker_attempts: job.snapshot.worker_attempts + 1,
       message: "Antigravity worker is applying revision feedback",
       revision_feedback: feedback,
       checks: [],

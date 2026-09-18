@@ -2,20 +2,6 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 
-const CodexConfigSchema = z.object({
-  command: z.string().min(1).default("codex"),
-  provider: z.string().min(1).optional(),
-  providerBaseUrl: z.string().url().optional(),
-  providerAuth: z.object({
-    command: z.string().min(1),
-    args: z.array(z.string()),
-  }).strict().optional(),
-  leaderModel: z.string().min(1).optional(),
-  reviewerModel: z.string().min(1).optional(),
-  reasoningEffort: z.enum(["low", "medium", "high", "xhigh"]).default("high"),
-  timeoutMs: z.number().int().positive().default(1_200_000),
-}).strict();
-
 const AntigravityConfigSchema = z.object({
   command: z.string().min(1).default("agy"),
   model: z.string().min(1).optional(),
@@ -28,25 +14,19 @@ const ValidationConfigSchema = z.object({
   allowedExecutables: z.array(z.string().min(1)).min(1),
 }).strict();
 
-const RouterConfigSchema = z.object({
-  baseUrl: z.string().url().default("http://127.0.0.1:20128/v1"),
-  required: z.boolean().default(true),
-}).strict();
-
-const ParallelConfigSchema = z.object({
-  maxWorkers: z.number().int().min(1).max(8).default(3),
-  maxTasks: z.number().int().min(2).max(16).default(8),
+const DelegationConfigSchema = z.object({
+  maxConcurrentWorkers: z.number().int().min(1).max(8).default(3),
+  maxDiffBytes: z.number().int().positive().max(2 * 1024 * 1024).default(256 * 1024),
+  maxDiffLines: z.number().int().positive().max(20_000).default(2_000),
 }).strict();
 
 export const HarnessConfigSchema = z.object({
   dataDirectory: z.string().min(1).default(".harness"),
   maxRevisionRounds: z.number().int().min(0).default(2),
   requireCleanRepository: z.boolean().default(true),
-  router: RouterConfigSchema,
-  codex: CodexConfigSchema,
   antigravity: AntigravityConfigSchema,
   validation: ValidationConfigSchema,
-  parallel: ParallelConfigSchema,
+  delegation: DelegationConfigSchema,
 }).strict();
 
 export type HarnessConfig = z.infer<typeof HarnessConfigSchema>;
