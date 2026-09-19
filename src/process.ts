@@ -8,6 +8,20 @@ export interface RunProcessOptions {
   timeoutMs: number;
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
+  onStdoutChunk?: (chunk: string) => void | Promise<void>;
+  onStderrChunk?: (chunk: string) => void | Promise<void>;
+  maxStdoutBytes?: number;
+  maxStderrBytes?: number;
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  return bytes.length <= maxBytes ? value : bytes.subarray(0, maxBytes).toString("utf8");
+}
+
+function utf8Tail(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  return bytes.length <= maxBytes ? value : bytes.subarray(bytes.length - maxBytes).toString("utf8");
 }
 
 function executableCandidates(command: string): string[] {
@@ -70,42 +84,115 @@ export async function runProcess(
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    let stdoutQueue = Promise.resolve();
+    let stderrQueue = Promise.resolve();
+    const maxStdout = options.maxStdoutBytes ?? (options.onStdoutChunk ? 64 * 1024 : 10 * 1024 * 1024);
+    const maxStderr = options.maxStderrBytes ?? 64 * 1024;
+
+    const cleanupResources = () => {
+      try {
+        child.stdin?.destroy();
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      } catch {
+        // Ignore errors during stream cleanup
+      }
+    };
 
     const abort = () => {
-      child.kill("SIGTERM");
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // Ignore kill errors if already exited
+      }
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+      const failure = error instanceof Error ? error : new Error(String(error));
+      let rejected = false;
+      const rejectAfterClose = () => {
+        if (rejected) return;
+        rejected = true;
+        cleanupResources();
+        reject(failure);
+      };
+      child.once("close", rejectAfterClose);
+      abort();
+      cleanupResources();
+      const fallback = setTimeout(rejectAfterClose, 1_000);
+      fallback.unref();
     };
     options.signal?.addEventListener("abort", abort, { once: true });
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
+
     child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
+      if (options.onStdoutChunk) {
+        child.stdout.pause();
+        stdoutQueue = stdoutQueue
+          .then(async () => await options.onStdoutChunk?.(chunk))
+          .then(() => {
+            if (!settled) child.stdout.resume();
+          });
+        void stdoutQueue.catch(fail);
+      }
+      const remainingStdoutBytes = maxStdout - Buffer.byteLength(stdout, "utf8");
+      if (remainingStdoutBytes > 0) {
+        stdout += utf8Prefix(chunk, remainingStdoutBytes);
+      }
     });
+
     child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
+      if (options.onStderrChunk) {
+        child.stderr.pause();
+        stderrQueue = stderrQueue
+          .then(async () => await options.onStderrChunk?.(chunk))
+          .then(() => {
+            if (!settled) child.stderr.resume();
+          });
+        void stderrQueue.catch(fail);
+      }
+      stderr = utf8Tail(stderr + chunk, maxStderr);
     });
 
-    child.once("error", reject);
+    child.once("error", (error) => {
+      fail(error);
+    });
 
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // Ignore
+      }
     }, options.timeoutMs);
 
     child.once("close", (exitCode, signal) => {
-      clearTimeout(timer);
-      options.signal?.removeEventListener("abort", abort);
-      resolve({
-        command: resolvedCommand,
-        args,
-        cwd: options.cwd,
-        exitCode,
-        signal,
-        stdout,
-        stderr,
-        durationMs: Date.now() - startedAt,
-        timedOut,
-      });
+      void Promise.all([stdoutQueue, stderrQueue]).then(() => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        options.signal?.removeEventListener("abort", abort);
+        cleanupResources();
+        resolve({
+          command: resolvedCommand,
+          args,
+          cwd: options.cwd,
+          exitCode,
+          signal,
+          stdout,
+          stderr,
+          durationMs: Date.now() - startedAt,
+          timedOut,
+        });
+      }).catch(fail);
     });
 
     if (options.stdin !== undefined) {
