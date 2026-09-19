@@ -11,6 +11,7 @@ import { HarnessConfigSchema, type HarnessConfig } from "../src/config.js";
 import { classifyDoctorFailure, runDeepDoctor } from "../src/doctor.js";
 import { findOutOfScopeFiles } from "../src/git.js";
 import {
+  DelegationRequestSchema,
   InteractiveDelegationService,
   type DelegationSnapshot,
   type InteractiveDelegationApi,
@@ -128,6 +129,37 @@ test("configuration rejects removed Codex provider and router settings", () => {
     ...testConfig(),
     codex: { command: "codex" },
   }));
+  assert.throws(() => DelegationRequestSchema.parse({
+    repository_path: ".",
+    objective: "invalid mapping",
+    allowed_paths: ["src/**"],
+    acceptance_criteria: ["one criterion"],
+    checks: [],
+    criterion_check_mapping: [{ criterion_index: 0, check_indices: [0] }],
+  }), /does not reference a validation check/);
+});
+
+test("delegation preview reports blockers without creating artifacts", async () => {
+  const fixture = await createRepository("harness-preview-");
+  const worker: Worker = { async run(): Promise<WorkerRunResult> { throw new Error("not used"); } };
+  try {
+    const service = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const preview = await service.preview({
+      repository_path: fixture.repoPath,
+      objective: "Preview unsafe contract",
+      allowed_paths: ["**"],
+      acceptance_criteria: ["Manual review remains explicit"],
+      checks: [{ command: "powershell", args: ["-Command", "exit 0"] }],
+    });
+    assert.equal(preview.can_delegate, false);
+    assert.match(preview.blockers.join(" "), /too broad/);
+    assert.match(preview.blockers.join(" "), /not allowed/);
+    assert.equal(preview.criteria[0]?.verification, "manual_review");
+    assert.match(preview.warnings.join(" "), /manual Codex review/);
+    await assert.rejects(access(path.join(fixture.harnessRoot, ".harness")));
+  } finally {
+    await rm(fixture.tempRoot, { recursive: true, force: true });
+  }
 });
 
 test("deep doctor exercises the worker and removes its disposable fixture", async () => {
@@ -219,12 +251,38 @@ test("chat delegation supports revision, bounded diff, persistence, and safe che
   try {
     const service = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
     await service.initialize();
-    const started = await service.delegate({
+    const proposal = {
       repository_path: fixture.repoPath,
       objective: "Create src/result.txt",
       allowed_paths: ["src/**"],
       acceptance_criteria: ["src/result.txt exists"],
       checks: [{ command: process.execPath, args: ["-e", "process.exit(0)"] }],
+      budgets: { max_changed_files: 1, max_diff_lines: 100, max_diff_bytes: 16_384 },
+      criterion_check_mapping: [{ criterion_index: 0, check_indices: [0] }],
+    };
+    const preview = await service.preview(proposal);
+    assert.equal(preview.can_delegate, true, preview.blockers.join("; "));
+    assert.equal(preview.criteria[0]?.verification, "automated_checks");
+    assert.equal(preview.validation_commands[0]?.allowed, true);
+    await assert.rejects(
+      service.delegate({
+        ...proposal,
+        objective: "Changed after preview",
+        preview_contract_hash: preview.contract_hash,
+      }),
+      /changed after preview/,
+    );
+    await writeFile(path.join(fixture.repoPath, "HEAD_DRIFT.md"), "drift\n", "utf8");
+    runGit(fixture.repoPath, ["add", "HEAD_DRIFT.md"]);
+    runGit(fixture.repoPath, ["commit", "-m", "preview head drift"]);
+    await assert.rejects(
+      service.delegate({ ...proposal, preview_contract_hash: preview.contract_hash }),
+      /changed after preview/,
+    );
+    const refreshedPreview = await service.preview(proposal);
+    const started = await service.delegate({
+      ...proposal,
+      preview_contract_hash: refreshedPreview.contract_hash,
     });
     await waitForState(service, started.id, "WAITING_FOR_REVISION");
     await service.requestRevision(started.id, "Remove the out-of-scope file and finish the task");
@@ -260,7 +318,9 @@ test("chat delegation supports revision, bounded diff, persistence, and safe che
     assert.deepEqual(firstReviewPage.scope_gate, { passed: true, out_of_scope_files: [] });
     assert.equal(firstReviewPage.validation.passed, true);
     assert.equal(firstReviewPage.validation.checks[0]?.stdout_tail, undefined);
-    assert.equal(firstReviewPage.acceptance_criteria[0]?.verification, "review_required");
+    assert.equal(firstReviewPage.acceptance_criteria[0]?.verification, "automated_checks");
+    assert.equal(firstReviewPage.acceptance_criteria[0]?.passed, true);
+    assert.equal(firstReviewPage.budget_gate.passed, true);
     assert.equal(firstReviewPage.diff_stat.files_changed, 1);
     assert.equal(firstReviewPage.diff_stat.additions, 1);
     assert.ok(firstReviewPage.diff_page.next_cursor);
@@ -316,6 +376,63 @@ test("chat delegation supports revision, bounded diff, persistence, and safe che
     const repeatedCleanup = await service.cleanupWorker(started.id, cleanupPreview.confirmation_token);
     assert.equal(repeatedCleanup.removed, false);
     assert.equal(repeatedCleanup.already_removed, true);
+  } finally {
+    await rm(fixture.tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("change budgets gate worker completion, review readiness, and handoff", async () => {
+  const fixture = await createRepository("harness-budget-");
+  let attempts = 0;
+  const worker: Worker = {
+    async run(task): Promise<WorkerRunResult> {
+      attempts += 1;
+      await mkdir(path.join(task.worktree_path, "src"), { recursive: true });
+      await writeFile(path.join(task.worktree_path, "src", "a.txt"), "a\n", "utf8");
+      if (attempts === 1) {
+        await writeFile(path.join(task.worktree_path, "src", "b.txt"), "b\n", "utf8");
+      } else {
+        await rm(path.join(task.worktree_path, "src", "b.txt"), { force: true });
+      }
+      return {
+        result: {
+          status: "success",
+          summary: "budget fixture",
+          files_changed: attempts === 1 ? ["src/a.txt", "src/b.txt"] : ["src/a.txt"],
+          checks_attempted: [],
+          residual_risks: [],
+          conversation_id: "budget-conversation",
+        },
+        process: processResult(task.worktree_path),
+      };
+    },
+  };
+
+  try {
+    const service = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const started = await service.delegate({
+      repository_path: fixture.repoPath,
+      objective: "Stay within one changed file",
+      allowed_paths: ["src/**"],
+      acceptance_criteria: ["src/a.txt exists"],
+      checks: [],
+      budgets: { max_changed_files: 1, max_diff_lines: 100, max_diff_bytes: 16_384 },
+    });
+    const overBudget = await waitForState(service, started.id, "WAITING_FOR_REVISION");
+    assert.match(overBudget.message, /exceeds the approved change budget/i);
+    assert.equal((await service.getMetrics(started.id)).last_failure_category, "budget_exceeded");
+
+    await service.requestRevision(started.id, "Remove src/b.txt to meet the approved budget");
+    const completed = await waitForState(service, started.id, "COMPLETED");
+    const withinBudget = await service.getReviewPacket(started.id);
+    assert.equal(withinBudget.budget_gate.passed, true);
+    assert.equal(withinBudget.review_ready, true);
+
+    await writeFile(path.join(completed.worktree_path, "src", "b.txt"), "late expansion\n", "utf8");
+    const expanded = await service.getReviewPacket(started.id);
+    assert.equal(expanded.budget_gate.passed, false);
+    assert.equal(expanded.review_ready, false);
+    await assert.rejects(service.prepareCherryPick(started.id), /Change budget failed before handoff/);
   } finally {
     await rm(fixture.tempRoot, { recursive: true, force: true });
   }
@@ -824,6 +941,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
   const service: InteractiveDelegationApi = {
     list: unavailable,
     diagnose: unavailable,
+    preview: unavailable,
     delegate: unavailable,
     getStatus: unavailable,
     getMetrics: unavailable,
@@ -856,6 +974,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
       "get_worker_status",
       "list_workers",
       "prepare_worker_cherry_pick",
+      "preview_delegation",
       "preview_worker_cleanup",
       "request_worker_revision",
       "resume_worker",

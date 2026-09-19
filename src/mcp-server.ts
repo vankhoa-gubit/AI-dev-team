@@ -19,6 +19,7 @@ export const SERVER_INSTRUCTIONS = [
   "Do not delegate implementation until the user has explicitly approved the plan in the current conversation.",
   "Codex in the current conversation is the only planner and reviewer; never create an autonomous Codex planner or reviewer.",
   "Delegate only bounded implementation work with explicit allowed paths, acceptance criteria, and validation checks.",
+  "Call preview_delegation before delegate_to_antigravity, present blockers and manual-review criteria to the user, and pass preview_contract_hash when delegating the unchanged contract.",
   "Use wait_for_worker instead of repeatedly polling status; after it returns a terminal state, review get_worker_review_packet and fetch every diff page before requesting a revision or preparing a cherry-pick.",
   "If a worker is INTERRUPTED by an MCP restart, use resume_worker; do not spend a revision round to recover it.",
   "The server never merges into or removes the user's target checkout or worktrees automatically.",
@@ -68,10 +69,27 @@ export function createInteractiveMcpServer(service: InteractiveDelegationApi): M
   );
 
   server.registerTool(
+    "preview_delegation",
+    {
+      title: "Preview Delegation Contract",
+      description: "Read-only preflight for a proposed delegation. Normalize scope, verify repository state and validation executables, detect active-worker overlap, expose change budgets and criterion/check coverage, and return a contract hash that can bind the later delegation.",
+      inputSchema: DelegationRequestSchema,
+      annotations: { readOnlyHint: true },
+    },
+    async (input) => {
+      try {
+        return toolResult(await service.preview(input));
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "delegate_to_antigravity",
     {
       title: "Delegate to Antigravity",
-      description: "After explicit user approval, create an isolated worktree and start one bounded Antigravity implementation asynchronously. Supply client_request_id to make retries idempotent.",
+      description: "After explicit user approval and preview_delegation, create an isolated worktree and start one bounded Antigravity implementation asynchronously. Pass preview_contract_hash to reject contract or HEAD drift; supply client_request_id to make retries idempotent.",
       inputSchema: DelegationRequestSchema,
     },
     async (input) => {
