@@ -19,7 +19,7 @@ export const SERVER_INSTRUCTIONS = [
   "Do not delegate implementation until the user has explicitly approved the plan in the current conversation.",
   "Codex in the current conversation is the only planner and reviewer; never create an autonomous Codex planner or reviewer.",
   "Delegate only bounded implementation work with explicit allowed paths, acceptance criteria, and validation checks.",
-  "Use wait_for_worker instead of repeatedly polling status; after it returns a terminal state, review get_worker_diff before requesting a revision or preparing a cherry-pick.",
+  "Use wait_for_worker instead of repeatedly polling status; after it returns a terminal state, review get_worker_review_packet and fetch every diff page before requesting a revision or preparing a cherry-pick.",
   "If a worker is INTERRUPTED by an MCP restart, use resume_worker; do not spend a revision round to recover it.",
   "The server never merges into or removes the user's target checkout or worktrees automatically.",
 ].join(" ");
@@ -111,6 +111,34 @@ export function createInteractiveMcpServer(service: InteractiveDelegationApi): M
     async ({ worker_id }) => {
       try {
         return toolResult(await service.getDiff(worker_id));
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_worker_review_packet",
+    {
+      title: "Get Worker Review Packet",
+      description: "Return a deterministic, quota-efficient review packet with task context, scope and validation gates, diff statistics, warnings, residual risks, and a cursor-paginated diff. Acceptance criteria always require Codex review.",
+      inputSchema: z.object({
+        worker_id: WorkerIdSchema,
+        path: z.string().min(1).optional(),
+        cursor: z.number().int().min(0).default(0),
+        max_bytes: z.number().int().min(1_024).max(262_144).default(49_152),
+        max_lines: z.number().int().min(20).max(2_000).default(300),
+      }).strict(),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ worker_id, path: reviewPath, cursor, max_bytes, max_lines }) => {
+      try {
+        return toolResult(await service.getReviewPacket(worker_id, {
+          ...(reviewPath ? { path: reviewPath } : {}),
+          cursor,
+          maxBytes: max_bytes,
+          maxLines: max_lines,
+        }));
       } catch (error) {
         return toolError(error);
       }

@@ -12,7 +12,7 @@ The harness does not invoke Codex CLI, use a model gateway, plan autonomously, r
 4. Antigravity implements the task.
 5. Codex uses a bounded `wait_for_worker` call instead of repeatedly polling status.
 6. The harness rejects denied actions, empty changes, out-of-scope files, and failed checks.
-7. Codex reads the bounded diff and either requests a revision or prepares a cherry-pick handoff.
+7. Codex reads the deterministic review packet and every paginated diff page, then either requests a revision or prepares a cherry-pick handoff.
 8. You explicitly decide whether to run the returned cherry-pick command.
 9. After handoff, Codex can preview and explicitly confirm removal of only the clean worker worktree.
 
@@ -79,6 +79,10 @@ handoff mutations.
 - `wait_for_worker`: wait for a terminal state or bounded timeout without repeated Codex polling.
 - `get_worker_result`: read the terminal worker result and validation evidence.
 - `get_worker_diff`: return a size-bounded Git diff, including untracked files.
+- `get_worker_review_packet`: return task context, scope and validation gates,
+  diff statistics, residual risks, warnings, and a cursor-paginated diff for
+  quota-efficient Codex review. Supply `path` to focus a changed file and pass
+  `next_cursor` back as `cursor` until no next cursor remains.
 - `resume_worker`: resume an interrupted worker without consuming a revision round.
 - `request_worker_revision`: resume the same Antigravity conversation with review feedback.
 - `prepare_worker_cherry_pick`: re-run safety gates, commit the isolated branch, and return a command without changing the target checkout.

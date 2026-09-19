@@ -147,14 +147,26 @@ export async function listChangedFiles(worktreePath: string): Promise<string[]> 
     });
 }
 
-export async function getWorktreeDiff(worktreePath: string, baseRef = "HEAD"): Promise<string> {
-  const tracked = await git(worktreePath, ["diff", "--binary", "--no-ext-diff", baseRef, "--"]);
+export async function getWorktreeDiff(
+  worktreePath: string,
+  baseRef = "HEAD",
+  pathFilter?: string,
+): Promise<string> {
+  const tracked = await git(worktreePath, [
+    "diff",
+    "--binary",
+    "--no-ext-diff",
+    baseRef,
+    "--",
+    ...(pathFilter ? [pathFilter] : []),
+  ]);
   assertProcessSucceeded(tracked, "git diff");
 
   const untrackedResult = await git(worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"]);
   assertProcessSucceeded(untrackedResult, "git list untracked files");
   const parts = [tracked.stdout];
   for (const file of untrackedResult.stdout.split("\0").filter(Boolean)) {
+    if (pathFilter && file.replaceAll("\\", "/") !== pathFilter) continue;
     const untracked = await git(worktreePath, [
       "diff", "--binary", "--no-index", "--", "/dev/null", file,
     ]);
