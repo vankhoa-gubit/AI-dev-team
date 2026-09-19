@@ -9,6 +9,7 @@
     "src/adapters/antigravity.ts",
     "src/cli.ts",
     "src/config.ts",
+    "src/doctor.ts",
     "src/git.ts",
     "src/interactive-delegation.ts",
     "src/mcp-server.ts",
