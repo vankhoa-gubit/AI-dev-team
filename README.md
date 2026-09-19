@@ -14,8 +14,9 @@ The harness does not invoke Codex CLI, use a model gateway, plan autonomously, r
 6. The harness rejects denied actions, empty changes, out-of-scope files, and failed checks.
 7. Codex reads the bounded diff and either requests a revision or prepares a cherry-pick handoff.
 8. You explicitly decide whether to run the returned cherry-pick command.
+9. After handoff, Codex can preview and explicitly confirm removal of only the clean worker worktree.
 
-Multiple workers may run concurrently only when their scopes are provably disjoint. The harness never auto-merges and never removes worktrees.
+Multiple workers may run concurrently only when their scopes are provably disjoint. The harness never auto-merges and never removes worktrees automatically.
 
 ## Setup
 
@@ -66,6 +67,8 @@ handoff mutations.
 - `resume_worker`: resume an interrupted worker without consuming a revision round.
 - `request_worker_revision`: resume the same Antigravity conversation with review feedback.
 - `prepare_worker_cherry_pick`: re-run safety gates, commit the isolated branch, and return a command without changing the target checkout.
+- `preview_worker_cleanup`: inspect the exact worktree target and blockers, then issue a short-lived confirmation token.
+- `cleanup_worker`: explicitly remove only the clean registered worker worktree while retaining its branch and artifacts.
 - `cancel_worker`: stop an active worker while preserving its artifacts.
 
 Delegation artifacts live under `.harness/delegations/<worker-id>`. If the MCP server restarts during execution, the persisted delegation becomes `INTERRUPTED` when its worktree is available. Codex can call `resume_worker` without consuming the review revision budget.
@@ -93,6 +96,12 @@ timings, conversation reuse, outcome, and any known failure category. The
 harness does not estimate tokens or monetary cost when the provider does not
 report them.
 
+Cleanup is an explicit two-step operation. `preview_worker_cleanup` is read-only
+and binds a five-minute token to the worker, state, worktree path, commit, and
+snapshot version. `cleanup_worker` rejects active, interrupted, revision-ready,
+dirty, moved, or stale targets; it never uses force, never removes the target
+checkout, and retains the worker branch plus delegation artifacts.
+
 Avoid broad scopes such as `**` when running concurrent workers. Overlapping scopes in the same repository are rejected.
 
 ## Configuration
@@ -118,6 +127,7 @@ No OAuth token, API key, Codex authentication file, provider database, or model 
 - Diff output is bounded by byte and line limits.
 - Cherry-pick preparation re-runs scope and validation gates.
 - The target checkout is never merged, reset, checked out, or otherwise mutated by the harness.
+- Worktree cleanup requires an exact preview token and uses registered Git worktree removal without force.
 
 ## Development
 

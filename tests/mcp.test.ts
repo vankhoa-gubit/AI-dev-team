@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -213,6 +213,23 @@ test("chat delegation supports revision, bounded diff, persistence, and safe che
     const committedDiff = await service.getDiff(started.id);
     assert.deepEqual(committedDiff.changed_files, ["src/result.txt"]);
     assert.match(committedDiff.diff, /result\.txt/);
+
+    const cleanupPreview = await service.previewCleanup(started.id);
+    assert.deepEqual(cleanupPreview.blockers, []);
+    assert.equal(cleanupPreview.worktree_clean, true);
+    assert.equal(cleanupPreview.cleanup_required, true);
+    assert.ok(cleanupPreview.confirmation_token);
+    const cleanup = await service.cleanupWorker(started.id, cleanupPreview.confirmation_token);
+    assert.equal(cleanup.removed, true);
+    assert.equal(cleanup.already_removed, false);
+    await assert.rejects(access(started.worktree_path));
+    await access(fixture.repoPath);
+    await access(path.join(fixture.harnessRoot, ".harness", "delegations", started.id, "task.json"));
+    await access(path.join(fixture.harnessRoot, ".harness", "delegations", started.id, "status.json"));
+    assert.ok(runGit(fixture.repoPath, ["show-ref", "--verify", `refs/heads/${started.branch}`]));
+    const repeatedCleanup = await service.cleanupWorker(started.id, cleanupPreview.confirmation_token);
+    assert.equal(repeatedCleanup.removed, false);
+    assert.equal(repeatedCleanup.already_removed, true);
   } finally {
     await rm(fixture.tempRoot, { recursive: true, force: true });
   }
@@ -405,6 +422,71 @@ test("worker metrics classify denied actions and provider timeouts", async () =>
   }
 });
 
+test("worker cleanup requires a safe current preview and refuses dirty or active worktrees", async () => {
+  const fixture = await createRepository("harness-cleanup-safety-");
+  let now = Date.now();
+  const worker: Worker = {
+    async run(task: TaskSpec, _directory, _feedback, _conversation, signal) {
+      await new Promise<void>((resolve) => {
+        signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return {
+        result: {
+          status: "success", summary: "cancelled", files_changed: [], checks_attempted: [], residual_risks: [],
+        },
+        process: processResult(task.worktree_path),
+      };
+    },
+  };
+  try {
+    const service = new InteractiveDelegationService(
+      testConfig(),
+      fixture.harnessRoot,
+      worker,
+      () => now,
+    );
+    const started = await service.delegate({
+      repository_path: fixture.repoPath,
+      objective: "Cleanup safety task",
+      allowed_paths: ["src/**"],
+      acceptance_criteria: ["done"],
+      checks: [],
+    });
+    const activePreview = await service.previewCleanup(started.id);
+    assert.equal(activePreview.confirmation_token, undefined);
+    assert.match(activePreview.blockers.join(" "), /not eligible/);
+
+    await mkdir(path.join(started.worktree_path, "src"), { recursive: true });
+    await writeFile(path.join(started.worktree_path, "src", "dirty.txt"), "dirty\n", "utf8");
+    await service.cancel(started.id);
+    const dirtyPreview = await service.previewCleanup(started.id);
+    assert.equal(dirtyPreview.confirmation_token, undefined);
+    assert.match(dirtyPreview.blockers.join(" "), /uncommitted changes/);
+
+    await rm(path.join(started.worktree_path, "src", "dirty.txt"), { force: true });
+    const expiringPreview = await service.previewCleanup(started.id);
+    assert.ok(expiringPreview.confirmation_token);
+    await assert.rejects(
+      service.cleanupWorker(started.id, "00000000-0000-4000-8000-000000000000"),
+      /Invalid cleanup confirmation token/,
+    );
+    now += 5 * 60 * 1_000 + 1;
+    await assert.rejects(
+      service.cleanupWorker(started.id, expiringPreview.confirmation_token),
+      /has expired/,
+    );
+    await assert.rejects(service.previewCleanup("../escape"), /Invalid delegation id/);
+
+    const currentPreview = await service.previewCleanup(started.id);
+    assert.ok(currentPreview.confirmation_token);
+    const cleaned = await service.cleanupWorker(started.id, currentPreview.confirmation_token);
+    assert.equal(cleaned.removed, true);
+    await access(fixture.repoPath);
+  } finally {
+    await rm(fixture.tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("server restart marks a worker interrupted and resumes without spending a revision", async () => {
   const fixture = await createRepository("harness-restart-");
   let attempts = 0;
@@ -501,6 +583,8 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
     getResult: unavailable,
     getDiff: unavailable,
     prepareCherryPick: unavailable,
+    previewCleanup: unavailable,
+    cleanupWorker: unavailable,
     resumeWorker: unavailable,
     requestRevision: unavailable,
     cancel: unavailable,
@@ -513,6 +597,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
     const tools = await client.listTools();
     assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
       "cancel_worker",
+      "cleanup_worker",
       "delegate_to_antigravity",
       "get_worker_diff",
       "get_worker_metrics",
@@ -520,6 +605,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
       "get_worker_status",
       "list_workers",
       "prepare_worker_cherry_pick",
+      "preview_worker_cleanup",
       "request_worker_revision",
       "resume_worker",
       "wait_for_worker",

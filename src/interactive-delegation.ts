@@ -13,6 +13,7 @@ import {
   getHeadSha,
   getWorktreeDiff,
   listChangedFiles,
+  removeWorktree,
 } from "./git.js";
 import { boundText, formatCommand } from "./output.js";
 import { findOverlappingScope } from "./scope.js";
@@ -122,6 +123,7 @@ export const DelegationSnapshotSchema = z.object({
   commit_sha: z.string().min(1).optional(),
   client_request_id: ClientRequestIdSchema.optional(),
   attempt_history: z.array(WorkerAttemptSchema).default([]),
+  worktree_removed_at: z.string().optional(),
 }).strict();
 
 export type DelegationSnapshot = z.infer<typeof DelegationSnapshotSchema>;
@@ -170,6 +172,45 @@ export interface WorkerMetrics {
   attempts: WorkerAttempt[];
 }
 
+export interface WorkerCleanupPreview {
+  worker_id: string;
+  state: DelegationState;
+  repository_path: string;
+  worktree_path: string;
+  branch: string;
+  commit_sha?: string;
+  worktree_exists: boolean;
+  worktree_clean: boolean;
+  cleanup_required: boolean;
+  branch_retained: true;
+  artifacts_retained: true;
+  changed_files: string[];
+  blockers: string[];
+  confirmation_token?: string;
+  expires_at?: string;
+}
+
+export interface WorkerCleanupResult {
+  worker_id: string;
+  worktree_path: string;
+  removed: boolean;
+  already_removed: boolean;
+  branch: string;
+  branch_retained: true;
+  artifacts_path: string;
+  artifacts_retained: true;
+}
+
+interface CleanupAuthorization {
+  workerId: string;
+  snapshotUpdatedAt: string;
+  state: DelegationState;
+  worktreePath: string;
+  commitSha?: string;
+  expiresAtMs: number;
+  completed?: WorkerCleanupResult;
+}
+
 interface ActiveDelegation {
   task: TaskSpec;
   jobDirectory: string;
@@ -188,6 +229,8 @@ export interface InteractiveDelegationApi {
   getResult(id: string): Promise<DelegationSnapshot>;
   getDiff(id: string): Promise<DelegationDiff>;
   prepareCherryPick(id: string): Promise<CherryPickHandoff>;
+  previewCleanup(id: string): Promise<WorkerCleanupPreview>;
+  cleanupWorker(id: string, confirmationToken: string): Promise<WorkerCleanupResult>;
   resumeWorker(id: string): Promise<DelegationSnapshot>;
   requestRevision(id: string, feedback: string): Promise<DelegationSnapshot>;
   cancel(id: string): Promise<DelegationSnapshot>;
@@ -223,6 +266,16 @@ function classifyFailure(error: unknown): FailureCategory {
   return "provider_error";
 }
 
+function pathsEqual(left: string, right: string): boolean {
+  const resolvedLeft = path.resolve(left);
+  const resolvedRight = path.resolve(right);
+  return process.platform === "win32"
+    ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+    : resolvedLeft === resolvedRight;
+}
+
+const CLEANUP_TOKEN_TTL_MS = 5 * 60 * 1_000;
+
 function assertDelegationId(id: string): void {
   if (!/^delegation-[A-Za-z0-9-]+$/.test(id)) {
     throw new Error("Invalid delegation id");
@@ -241,12 +294,14 @@ async function pathExists(candidate: string): Promise<boolean> {
 export class InteractiveDelegationService implements InteractiveDelegationApi {
   private readonly active = new Map<string, ActiveDelegation>();
   private readonly pendingDelegations = new Map<string, Promise<DelegationStartResult>>();
+  private readonly cleanupAuthorizations = new Map<string, CleanupAuthorization>();
   private readonly delegationsRoot: string;
 
   constructor(
     private readonly config: HarnessConfig,
     private readonly harnessRoot: string,
     private readonly worker: Worker,
+    private readonly now: () => number = () => Date.now(),
   ) {
     this.delegationsRoot = path.resolve(harnessRoot, config.dataDirectory, "delegations");
   }
@@ -601,6 +656,93 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     };
   }
 
+  async previewCleanup(id: string): Promise<WorkerCleanupPreview> {
+    const job = await this.loadActiveJob(id);
+    const preview = await this.inspectCleanup(job);
+    if (preview.blockers.length > 0) {
+      return preview;
+    }
+
+    const confirmationToken = randomUUID();
+    const expiresAtMs = this.now() + CLEANUP_TOKEN_TTL_MS;
+    this.cleanupAuthorizations.set(confirmationToken, {
+      workerId: id,
+      snapshotUpdatedAt: job.snapshot.updated_at,
+      state: job.snapshot.state,
+      worktreePath: job.task.worktree_path,
+      ...(job.snapshot.commit_sha ? { commitSha: job.snapshot.commit_sha } : {}),
+      expiresAtMs,
+    });
+    return {
+      ...preview,
+      confirmation_token: confirmationToken,
+      expires_at: new Date(expiresAtMs).toISOString(),
+    };
+  }
+
+  async cleanupWorker(
+    id: string,
+    confirmationToken: string,
+  ): Promise<WorkerCleanupResult> {
+    const authorization = this.cleanupAuthorizations.get(confirmationToken);
+    if (!authorization || authorization.workerId !== id) {
+      throw new Error("Invalid cleanup confirmation token");
+    }
+    if (authorization.completed) {
+      return {
+        ...authorization.completed,
+        removed: false,
+        already_removed: true,
+      };
+    }
+    if (this.now() > authorization.expiresAtMs) {
+      this.cleanupAuthorizations.delete(confirmationToken);
+      throw new Error("Cleanup confirmation token has expired; request a new preview");
+    }
+
+    const job = await this.loadActiveJob(id);
+    if (
+      authorization.snapshotUpdatedAt !== job.snapshot.updated_at
+      || authorization.state !== job.snapshot.state
+      || !pathsEqual(authorization.worktreePath, job.task.worktree_path)
+      || (authorization.commitSha ?? "") !== (job.snapshot.commit_sha ?? "")
+    ) {
+      throw new Error("Worker changed after cleanup preview; request a new preview");
+    }
+
+    const preview = await this.inspectCleanup(job);
+    if (preview.blockers.length > 0) {
+      throw new Error(`Worker cleanup is blocked: ${preview.blockers.join("; ")}`);
+    }
+
+    const existedBefore = preview.worktree_exists;
+    if (existedBefore) {
+      await removeWorktree(job.task.repository_path, job.task.worktree_path);
+      if (await pathExists(job.task.worktree_path)) {
+        throw new Error(`Git reported success but the worker worktree still exists: ${job.task.worktree_path}`);
+      }
+    }
+
+    if (!job.snapshot.worktree_removed_at) {
+      await this.update(job, {
+        worktree_removed_at: new Date(this.now()).toISOString(),
+        message: "Worker worktree removed after explicit confirmation; branch and artifacts were retained",
+      });
+    }
+    const result: WorkerCleanupResult = {
+      worker_id: id,
+      worktree_path: job.task.worktree_path,
+      removed: existedBefore,
+      already_removed: !existedBefore,
+      branch: job.task.branch,
+      branch_retained: true,
+      artifacts_path: job.jobDirectory,
+      artifacts_retained: true,
+    };
+    authorization.completed = result;
+    return result;
+  }
+
   async resumeWorker(id: string): Promise<DelegationSnapshot> {
     const job = await this.loadActiveJob(id);
     if (job.snapshot.state !== "INTERRUPTED") {
@@ -832,6 +974,49 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       }
     }
     return attempts;
+  }
+
+  private async inspectCleanup(job: ActiveDelegation): Promise<WorkerCleanupPreview> {
+    const blockers: string[] = [];
+    if (!["COMPLETED", "FAILED", "CANCELLED"].includes(job.snapshot.state)) {
+      blockers.push(`state ${job.snapshot.state} is not eligible for cleanup`);
+    }
+    if (job.snapshot.state === "COMPLETED" && !job.snapshot.commit_sha) {
+      blockers.push("completed worker must be prepared for cherry-pick before cleanup");
+    }
+
+    const expectedWorktree = path.resolve(job.jobDirectory, "worktree");
+    const resolvedWorktree = path.resolve(job.task.worktree_path);
+    const safeWorktreePath = pathsEqual(expectedWorktree, resolvedWorktree)
+      && !pathsEqual(job.task.repository_path, resolvedWorktree);
+    if (!safeWorktreePath) {
+      blockers.push("persisted worktree path is outside the exact delegation worktree location");
+    }
+
+    const worktreeExists = await pathExists(resolvedWorktree);
+    let changedFiles: string[] = [];
+    if (worktreeExists && safeWorktreePath) {
+      changedFiles = await listChangedFiles(resolvedWorktree);
+      if (changedFiles.length > 0) {
+        blockers.push(`worktree has uncommitted changes: ${changedFiles.join(", ")}`);
+      }
+    }
+
+    return {
+      worker_id: job.task.id,
+      state: job.snapshot.state,
+      repository_path: job.task.repository_path,
+      worktree_path: resolvedWorktree,
+      branch: job.task.branch,
+      ...(job.snapshot.commit_sha ? { commit_sha: job.snapshot.commit_sha } : {}),
+      worktree_exists: worktreeExists,
+      worktree_clean: !worktreeExists || changedFiles.length === 0,
+      cleanup_required: worktreeExists,
+      branch_retained: true,
+      artifacts_retained: true,
+      changed_files: changedFiles,
+      blockers,
+    };
   }
 
   private finishAttemptHistory(

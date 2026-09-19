@@ -171,6 +171,43 @@ export function createInteractiveMcpServer(service: InteractiveDelegationApi): M
   );
 
   server.registerTool(
+    "preview_worker_cleanup",
+    {
+      title: "Preview worker cleanup",
+      description: "Inspect exact cleanup targets and blockers, then issue a short-lived confirmation token without changing the worktree, branch, or artifacts.",
+      inputSchema: z.object({ worker_id: WorkerIdSchema }).strict(),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ worker_id }) => {
+      try {
+        return toolResult(await service.previewCleanup(worker_id));
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "cleanup_worker",
+    {
+      title: "Cleanup worker worktree",
+      description: "After an explicit preview and confirmation, remove only the clean registered worker worktree while retaining its branch and artifacts.",
+      inputSchema: z.object({
+        worker_id: WorkerIdSchema,
+        confirmation_token: z.string().uuid(),
+      }).strict(),
+      annotations: { destructiveHint: true, idempotentHint: true },
+    },
+    async ({ worker_id, confirmation_token }) => {
+      try {
+        return toolResult(await service.cleanupWorker(worker_id, confirmation_token));
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "get_worker_result",
     {
       title: "Get worker result",

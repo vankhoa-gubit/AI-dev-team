@@ -17,12 +17,13 @@ Date: 2026-09-18; incremental validation updated 2026-09-19 (Asia/Bangkok)
 `npm run check` passed:
 
 - strict TypeScript typecheck
-- 10 MCP-focused tests
+- 11 MCP-focused tests
 - production build
 
-The STDIO handshake returned all eleven expected tools:
+The STDIO handshake returned all thirteen expected tools:
 
 - `cancel_worker`
+- `cleanup_worker`
 - `delegate_to_antigravity`
 - `get_worker_diff`
 - `get_worker_metrics`
@@ -30,6 +31,7 @@ The STDIO handshake returned all eleven expected tools:
 - `get_worker_status`
 - `list_workers`
 - `prepare_worker_cherry_pick`
+- `preview_worker_cleanup`
 - `request_worker_revision`
 - `resume_worker`
 - `wait_for_worker`
@@ -38,7 +40,7 @@ The 2026-09-19 incremental validation added completion and bounded-timeout
 coverage for `wait_for_worker`, plus restart recovery coverage proving that
 `resume_worker` preserves the worktree, reuses a persisted conversation ID, and
 does not consume a revision round. A fresh STDIO `listTools` handshake against
-the production build returned all eleven tools. The real-provider smoke test below
+the production build returned all thirteen tools. The real-provider smoke test below
 was not repeated for these orchestration-only changes, avoiding an unnecessary
 Antigravity invocation.
 
@@ -48,6 +50,11 @@ task contract is rejected before another Antigravity invocation. Metrics
 coverage verifies initial/revision/resume history, persisted timings,
 conversation reuse, interruption, scope violations, denied actions, and
 provider timeouts without estimating tokens or cost.
+
+Cleanup coverage verifies read-only preview, terminal-state gating, dirty-tree
+rejection, invalid and expired tokens, path-traversal rejection, exact Git
+worktree removal without force, preservation of the target checkout, branch and
+artifacts, and idempotent repeated cleanup.
 
 ## Real Antigravity smoke test
 

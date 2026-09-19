@@ -42,6 +42,33 @@ export async function createWorktree(
   assertProcessSucceeded(result, "git worktree add");
 }
 
+export async function removeWorktree(repoPath: string, worktreePath: string): Promise<void> {
+  const resolvedRepository = path.resolve(repoPath);
+  const resolvedWorktree = path.resolve(worktreePath);
+  const samePath = process.platform === "win32"
+    ? resolvedRepository.toLowerCase() === resolvedWorktree.toLowerCase()
+    : resolvedRepository === resolvedWorktree;
+  if (samePath) {
+    throw new Error("Refusing to remove the target repository checkout as a worker worktree");
+  }
+
+  const listed = await git(resolvedRepository, ["worktree", "list", "--porcelain"]);
+  assertProcessSucceeded(listed, "git worktree list");
+  const registered = listed.stdout
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => path.resolve(line.slice("worktree ".length)))
+    .some((candidate) => process.platform === "win32"
+      ? candidate.toLowerCase() === resolvedWorktree.toLowerCase()
+      : candidate === resolvedWorktree);
+  if (!registered) {
+    throw new Error(`Worker worktree is not registered with Git: ${resolvedWorktree}`);
+  }
+
+  const result = await git(resolvedRepository, ["worktree", "remove", resolvedWorktree]);
+  assertProcessSucceeded(result, "git worktree remove");
+}
+
 export async function commitAll(worktreePath: string, message: string): Promise<string> {
   const add = await git(worktreePath, ["add", "--all"]);
   assertProcessSucceeded(add, "git add");
