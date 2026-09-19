@@ -251,6 +251,35 @@ test("chat delegation supports revision, bounded diff, persistence, and safe che
     assert.match(diff.diff, /\+done/);
     assert.equal(diff.truncated, false);
 
+    const firstReviewPage = await service.getReviewPacket(started.id, {
+      maxBytes: 1_024,
+      maxLines: 4,
+    });
+    assert.equal(firstReviewPage.review_ready, true);
+    assert.deepEqual(firstReviewPage.changed_files, ["src/result.txt"]);
+    assert.deepEqual(firstReviewPage.scope_gate, { passed: true, out_of_scope_files: [] });
+    assert.equal(firstReviewPage.validation.passed, true);
+    assert.equal(firstReviewPage.validation.checks[0]?.stdout_tail, undefined);
+    assert.equal(firstReviewPage.acceptance_criteria[0]?.verification, "review_required");
+    assert.equal(firstReviewPage.diff_stat.files_changed, 1);
+    assert.equal(firstReviewPage.diff_stat.additions, 1);
+    assert.ok(firstReviewPage.diff_page.next_cursor);
+    assert.match(firstReviewPage.warnings.join(" "), /paginated/i);
+
+    const focusedReview = await service.getReviewPacket(started.id, {
+      path: "src/result.txt",
+      cursor: firstReviewPage.diff_page.next_cursor,
+      maxBytes: 1_024,
+      maxLines: 100,
+    });
+    assert.equal(focusedReview.diff_page.path, "src/result.txt");
+    assert.match(focusedReview.diff_page.text, /\+done/);
+    assert.equal(focusedReview.diff_page.next_cursor, undefined);
+    await assert.rejects(
+      service.getReviewPacket(started.id, { path: "README.md" }),
+      /not a changed file/,
+    );
+
     const listed = await service.list(fixture.repoPath);
     assert.equal(listed[0]?.id, started.id);
     const persisted = JSON.parse(await readFile(
@@ -801,6 +830,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
     waitForWorker: unavailable,
     getResult: unavailable,
     getDiff: unavailable,
+    getReviewPacket: unavailable,
     prepareCherryPick: unavailable,
     previewCleanup: unavailable,
     cleanupWorker: unavailable,
@@ -822,6 +852,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
       "get_worker_diff",
       "get_worker_metrics",
       "get_worker_result",
+      "get_worker_review_packet",
       "get_worker_status",
       "list_workers",
       "prepare_worker_cherry_pick",

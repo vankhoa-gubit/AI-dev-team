@@ -17,7 +17,7 @@ import {
   listChangedFiles,
   removeWorktree,
 } from "./git.js";
-import { boundText, formatCommand } from "./output.js";
+import { boundText, formatCommand, pageText } from "./output.js";
 import {
   inspectJsonFile,
   listCorruptEvidence,
@@ -145,6 +145,65 @@ export interface DelegationDiff {
   truncated: boolean;
 }
 
+export interface ReviewPacketOptions {
+  path?: string;
+  cursor?: number;
+  maxBytes?: number;
+  maxLines?: number;
+}
+
+export interface ReviewPacket {
+  worker_id: string;
+  state: DelegationState;
+  review_ready: boolean;
+  objective: string;
+  acceptance_criteria: Array<{ criterion: string; verification: "review_required" }>;
+  allowed_paths: string[];
+  base_sha: string;
+  branch: string;
+  revision_round: number;
+  changed_files: string[];
+  diff_stat: {
+    files_changed: number;
+    additions: number;
+    deletions: number;
+    binary_files: string[];
+  };
+  scope_gate: {
+    passed: boolean;
+    out_of_scope_files: string[];
+  };
+  validation: {
+    configured_checks: number;
+    recorded_checks: number;
+    passed: boolean | null;
+    checks: Array<{
+      command: string;
+      args: string[];
+      passed: boolean;
+      exit_code: number | null;
+      duration_ms: number;
+      timed_out: boolean;
+      stdout_tail?: string;
+      stderr_tail?: string;
+    }>;
+  };
+  worker_summary?: string;
+  residual_risks: string[];
+  warnings: string[];
+  diff_page: {
+    path?: string;
+    cursor: number;
+    next_cursor?: number;
+    returned_lines: number;
+    total_lines: number;
+    total_bytes: number;
+    truncated: boolean;
+    truncated_line: boolean;
+    text: string;
+  };
+}
+
 export interface CherryPickHandoff {
   worker_id: string;
   repository_path: string;
@@ -265,6 +324,7 @@ export interface InteractiveDelegationApi {
   waitForWorker(id: string, timeoutMs: number): Promise<WaitWorkerResult>;
   getResult(id: string): Promise<DelegationSnapshot>;
   getDiff(id: string): Promise<DelegationDiff>;
+  getReviewPacket(id: string, options?: ReviewPacketOptions): Promise<ReviewPacket>;
   prepareCherryPick(id: string): Promise<CherryPickHandoff>;
   previewCleanup(id: string): Promise<WorkerCleanupPreview>;
   cleanupWorker(id: string, confirmationToken: string): Promise<WorkerCleanupResult>;
@@ -289,6 +349,34 @@ function checkEvidence(checks: CheckResult[]) {
     stdout_tail: check.stdout.slice(-4000),
     stderr_tail: check.stderr.slice(-4000),
   }));
+}
+
+function summarizeDiff(raw: string, changedFiles: string[]): ReviewPacket["diff_stat"] {
+  let additions = 0;
+  let deletions = 0;
+  let currentFile: string | undefined;
+  const binaryFiles = new Set<string>();
+  for (const line of raw.split(/\r?\n/)) {
+    if (line.startsWith("diff --git ")) {
+      currentFile = changedFiles.find((file) => (
+        line.includes(` b/${file}`)
+        || line.includes(` "b/${file}"`)
+      ));
+      continue;
+    }
+    if (line === "GIT binary patch" || line.startsWith("Binary files ")) {
+      if (currentFile) binaryFiles.add(currentFile);
+      continue;
+    }
+    if (line.startsWith("+") && !line.startsWith("+++")) additions += 1;
+    if (line.startsWith("-") && !line.startsWith("---")) deletions += 1;
+  }
+  return {
+    files_changed: changedFiles.length,
+    additions,
+    deletions,
+    binary_files: [...binaryFiles].sort(),
+  };
 }
 
 function isActive(state: DelegationState): boolean {
@@ -664,6 +752,108 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       changed_files: liveChangedFiles.length > 0 ? liveChangedFiles : job.snapshot.changed_files,
       diff: bounded.text,
       truncated: bounded.truncated,
+    };
+  }
+
+  async getReviewPacket(id: string, options: ReviewPacketOptions = {}): Promise<ReviewPacket> {
+    const job = await this.loadActiveJob(id);
+    if (job.snapshot.state === "PREPARING") {
+      throw new Error(`Delegation ${id} does not have a worktree yet`);
+    }
+    if (job.snapshot.worktree_removed_at) {
+      throw new Error(`Delegation ${id} worktree has already been removed`);
+    }
+
+    const changedFiles = await listChangedFiles(job.task.worktree_path);
+    let selectedPath: string | undefined;
+    if (options.path) {
+      const normalized = options.path.replaceAll("\\", "/").replace(/^\.\//, "");
+      selectedPath = changedFiles.find((file) => pathsEqual(file, normalized));
+      if (!selectedPath) {
+        throw new Error(`Review path is not a changed file in delegation ${id}: ${options.path}`);
+      }
+    }
+
+    const rawDiff = await getWorktreeDiff(job.task.worktree_path, job.task.base_sha, selectedPath);
+    const cursor = options.cursor ?? 0;
+    const maxBytes = Math.min(options.maxBytes ?? 48 * 1024, this.config.delegation.maxDiffBytes);
+    const maxLines = Math.min(options.maxLines ?? 300, this.config.delegation.maxDiffLines);
+    const page = pageText(rawDiff, cursor, maxBytes, maxLines);
+    const fullDiff = selectedPath
+      ? await getWorktreeDiff(job.task.worktree_path, job.task.base_sha)
+      : rawDiff;
+    const outOfScope = findOutOfScopeFiles(changedFiles, job.task.allowed_paths);
+    const diffStat = summarizeDiff(fullDiff, changedFiles);
+    const checks = job.snapshot.checks.map((check) => ({
+      command: check.command,
+      args: check.args,
+      passed: check.passed,
+      exit_code: check.exit_code,
+      duration_ms: check.duration_ms,
+      timed_out: check.timed_out,
+      ...(!check.passed && check.stdout_tail ? { stdout_tail: check.stdout_tail } : {}),
+      ...(!check.passed && check.stderr_tail ? { stderr_tail: check.stderr_tail } : {}),
+    }));
+    const validationPassed = job.task.checks.length === 0
+      ? null
+      : checks.length === job.task.checks.length && checks.every((check) => check.passed);
+    const residualRisks = job.snapshot.worker_result?.residual_risks ?? [];
+    const warnings: string[] = [];
+    if (job.snapshot.state !== "COMPLETED") warnings.push(`Worker state is ${job.snapshot.state}, not COMPLETED.`);
+    if (changedFiles.length === 0) warnings.push("No changed files are available for review.");
+    if (outOfScope.length > 0) warnings.push(`Out-of-scope files: ${outOfScope.join(", ")}`);
+    if (job.task.checks.length === 0) warnings.push("No validation commands were configured.");
+    if (validationPassed === false) warnings.push("One or more configured validation checks did not pass.");
+    if (residualRisks.length > 0) warnings.push("The worker reported residual risks that require reviewer attention.");
+    if (diffStat.binary_files.length > 0) warnings.push("Binary changes require separate inspection.");
+    if (page.nextCursor !== undefined) warnings.push("The selected diff is paginated; fetch the next cursor before approval.");
+    if (page.truncatedLine) warnings.push("One diff line exceeded the byte limit and was truncated.");
+
+    const reviewReady = job.snapshot.state === "COMPLETED"
+      && changedFiles.length > 0
+      && outOfScope.length === 0
+      && validationPassed !== false;
+    return {
+      worker_id: id,
+      state: job.snapshot.state,
+      review_ready: reviewReady,
+      objective: job.task.objective,
+      acceptance_criteria: job.task.acceptance_criteria.map((criterion) => ({
+        criterion,
+        verification: "review_required" as const,
+      })),
+      allowed_paths: job.task.allowed_paths,
+      base_sha: job.task.base_sha,
+      branch: job.task.branch,
+      revision_round: job.snapshot.revision_round,
+      changed_files: changedFiles,
+      diff_stat: diffStat,
+      scope_gate: {
+        passed: outOfScope.length === 0,
+        out_of_scope_files: outOfScope,
+      },
+      validation: {
+        configured_checks: job.task.checks.length,
+        recorded_checks: checks.length,
+        passed: validationPassed,
+        checks,
+      },
+      ...(job.snapshot.worker_result?.summary
+        ? { worker_summary: job.snapshot.worker_result.summary }
+        : {}),
+      residual_risks: residualRisks,
+      warnings,
+      diff_page: {
+        ...(selectedPath ? { path: selectedPath } : {}),
+        cursor: page.cursor,
+        ...(page.nextCursor !== undefined ? { next_cursor: page.nextCursor } : {}),
+        returned_lines: page.returnedLines,
+        total_lines: page.totalLines,
+        total_bytes: page.totalBytes,
+        truncated: page.nextCursor !== undefined,
+        truncated_line: page.truncatedLine,
+        text: page.text,
+      },
     };
   }
 
