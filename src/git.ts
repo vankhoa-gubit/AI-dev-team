@@ -69,6 +69,28 @@ export async function removeWorktree(repoPath: string, worktreePath: string): Pr
   assertProcessSucceeded(result, "git worktree remove");
 }
 
+export async function gitBranchExists(repoPath: string, branch: string): Promise<boolean> {
+  const result = await git(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+  if (result.timedOut) return false;
+  if (result.exitCode === 0) return true;
+  if (result.exitCode === 1) return false;
+  assertProcessSucceeded(result, "git branch existence check");
+  return false;
+}
+
+export async function isRegisteredWorktree(repoPath: string, worktreePath: string): Promise<boolean> {
+  const result = await git(repoPath, ["worktree", "list", "--porcelain"]);
+  assertProcessSucceeded(result, "git worktree list");
+  const resolvedWorktree = path.resolve(worktreePath);
+  return result.stdout
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => path.resolve(line.slice("worktree ".length)))
+    .some((candidate) => process.platform === "win32"
+      ? candidate.toLowerCase() === resolvedWorktree.toLowerCase()
+      : candidate === resolvedWorktree);
+}
+
 export async function commitAll(worktreePath: string, message: string): Promise<string> {
   const add = await git(worktreePath, ["add", "--all"]);
   assertProcessSucceeded(add, "git add");

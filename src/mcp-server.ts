@@ -84,6 +84,23 @@ export function createInteractiveMcpServer(service: InteractiveDelegationApi): M
   );
 
   server.registerTool(
+    "diagnose_delegation",
+    {
+      title: "Diagnose delegation persistence",
+      description: "Inspect one or all persisted delegations, including corrupt primary or backup JSON, recovery source, worktree and branch existence, and safe manual remediation.",
+      inputSchema: z.object({ worker_id: WorkerIdSchema.optional() }).strict(),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ worker_id }) => {
+      try {
+        return toolResult(await service.diagnose(worker_id));
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "get_worker_diff",
     {
       title: "Get Worker Diff",

@@ -17,14 +17,15 @@ Date: 2026-09-18; incremental validation updated 2026-09-19 (Asia/Bangkok)
 `npm run check` passed:
 
 - strict TypeScript typecheck
-- 11 MCP-focused tests
+- 14 MCP-focused tests
 - production build
 
-The STDIO handshake returned all thirteen expected tools:
+The STDIO handshake returned all fourteen expected tools:
 
 - `cancel_worker`
 - `cleanup_worker`
 - `delegate_to_antigravity`
+- `diagnose_delegation`
 - `get_worker_diff`
 - `get_worker_metrics`
 - `get_worker_result`
@@ -39,8 +40,10 @@ The STDIO handshake returned all thirteen expected tools:
 The 2026-09-19 incremental validation added completion and bounded-timeout
 coverage for `wait_for_worker`, plus restart recovery coverage proving that
 `resume_worker` preserves the worktree, reuses a persisted conversation ID, and
-does not consume a revision round. A fresh STDIO `listTools` handshake against
-the production build returned all thirteen tools. The real-provider smoke test below
+does not consume a revision round. Persistence recovery coverage verifies atomic
+writes, valid-backup fallback, corrupt-evidence preservation, unrecoverable task/status
+diagnostics, and restart behavior around an unrenamed temporary file. A fresh STDIO
+`listTools` handshake against the production build returned all fourteen tools. The real-provider smoke test below
 was not repeated for these orchestration-only changes, avoiding an unnecessary
 Antigravity invocation.
 

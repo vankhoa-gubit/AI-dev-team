@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import type { Worker } from "./adapters/antigravity.js";
@@ -12,10 +12,19 @@ import {
   findOutOfScopeFiles,
   getHeadSha,
   getWorktreeDiff,
+  gitBranchExists,
+  isRegisteredWorktree,
   listChangedFiles,
   removeWorktree,
 } from "./git.js";
 import { boundText, formatCommand } from "./output.js";
+import {
+  inspectJsonFile,
+  listCorruptEvidence,
+  readJsonWithFallback,
+  writeJsonAtomically,
+  type JsonFileState,
+} from "./persistence.js";
 import { findOverlappingScope } from "./scope.js";
 import {
   ClientRequestIdSchema,
@@ -201,6 +210,32 @@ export interface WorkerCleanupResult {
   artifacts_retained: true;
 }
 
+export interface DelegationFileDiagnostic {
+  path: string;
+  primary_state: JsonFileState;
+  backup_path?: string;
+  backup_state?: JsonFileState;
+  recovery_source?: "primary" | "backup";
+  error?: string;
+  corrupt_evidence_paths: string[];
+}
+
+export interface DelegationDiagnostic {
+  worker_id: string;
+  healthy: boolean;
+  task_file: DelegationFileDiagnostic;
+  status_file: DelegationFileDiagnostic;
+  repository_path?: string;
+  worktree_path?: string;
+  branch?: string;
+  repository_exists?: boolean;
+  worktree_exists?: boolean;
+  worktree_registered?: boolean;
+  branch_exists?: boolean;
+  issues: string[];
+  safe_remediation: string[];
+}
+
 interface CleanupAuthorization {
   workerId: string;
   snapshotUpdatedAt: string;
@@ -218,10 +253,12 @@ interface ActiveDelegation {
   controller?: AbortController;
   runPromise?: Promise<void>;
   cancelRequested: boolean;
+  updateQueue: Promise<void>;
 }
 
 export interface InteractiveDelegationApi {
   list(repositoryPath?: string): Promise<DelegationSnapshot[]>;
+  diagnose(id?: string): Promise<DelegationDiagnostic[]>;
   delegate(request: DelegationRequest): Promise<DelegationStartResult>;
   getStatus(id: string): Promise<DelegationSnapshot>;
   getMetrics(id: string): Promise<WorkerMetrics>;
@@ -328,8 +365,8 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
               message: "MCP server restarted before the isolated worktree was available.",
               attempt_history: this.finishAttemptHistory(job, "failed", "provider_error"),
             });
-      } catch {
-        // A corrupt delegation remains on disk for manual diagnosis and does not block the server.
+      } catch (error) {
+        console.error(`Delegation ${entry.name} requires diagnosis: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   }
@@ -351,6 +388,18 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       }
     }
     return snapshots.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+  }
+
+  async diagnose(id?: string): Promise<DelegationDiagnostic[]> {
+    if (id) assertDelegationId(id);
+    await mkdir(this.delegationsRoot, { recursive: true });
+    const ids = id
+      ? [id]
+      : (await readdir(this.delegationsRoot, { withFileTypes: true }))
+          .filter((entry) => entry.isDirectory() && /^delegation-[A-Za-z0-9-]+$/.test(entry.name))
+          .map((entry) => entry.name)
+          .sort();
+    return await Promise.all(ids.map(async (workerId) => await this.diagnoseOne(workerId)));
   }
 
   async delegate(input: DelegationRequest): Promise<DelegationStartResult> {
@@ -485,7 +534,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       worker_instructions: request.worker_instructions ?? request.objective,
       client_request_id: request.client_request_id,
     });
-    await writeFile(path.join(jobDirectory, "task.json"), `${JSON.stringify(task, null, 2)}\n`, "utf8");
+    await writeJsonAtomically(path.join(jobDirectory, "task.json"), task);
 
     const now = new Date().toISOString();
     const snapshot: DelegationSnapshot = {
@@ -508,7 +557,13 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       client_request_id: request.client_request_id,
       attempt_history: [],
     };
-    const job: ActiveDelegation = { task, jobDirectory, snapshot, cancelRequested: false };
+    const job: ActiveDelegation = {
+      task,
+      jobDirectory,
+      snapshot,
+      cancelRequested: false,
+      updateQueue: Promise.resolve(),
+    };
     this.active.set(id, job);
     await this.persist(job);
 
@@ -1051,20 +1106,28 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     job: ActiveDelegation,
     patch: Partial<DelegationSnapshot>,
   ): Promise<void> {
-    job.snapshot = DelegationSnapshotSchema.parse({
-      ...job.snapshot,
-      ...patch,
-      updated_at: new Date().toISOString(),
+    const operation = job.updateQueue.then(async () => {
+      const nextSnapshot = DelegationSnapshotSchema.parse({
+        ...job.snapshot,
+        ...patch,
+        updated_at: new Date().toISOString(),
+      });
+      await this.persist(job, nextSnapshot);
+      job.snapshot = nextSnapshot;
     });
-    await this.persist(job);
+    job.updateQueue = operation.catch(() => undefined);
+    await operation;
   }
 
-  private async persist(job: ActiveDelegation): Promise<void> {
-    await writeFile(
-      path.join(job.jobDirectory, "status.json"),
-      `${JSON.stringify(job.snapshot, null, 2)}\n`,
-      "utf8",
-    );
+  private async persist(
+    job: ActiveDelegation,
+    snapshot: DelegationSnapshot = job.snapshot,
+  ): Promise<void> {
+    const statusPath = path.join(job.jobDirectory, "status.json");
+    await writeJsonAtomically(statusPath, snapshot, {
+      backupPath: `${statusPath}.bak`,
+      parseExisting: (input) => DelegationSnapshotSchema.parse(input),
+    });
   }
 
   private async loadSnapshot(id: string): Promise<DelegationSnapshot> {
@@ -1073,8 +1136,12 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     if (active) {
       return active.snapshot;
     }
-    const raw = await readFile(path.join(this.delegationsRoot, id, "status.json"), "utf8");
-    return DelegationSnapshotSchema.parse(JSON.parse(raw));
+    const statusPath = path.join(this.delegationsRoot, id, "status.json");
+    return (await readJsonWithFallback(
+      statusPath,
+      `${statusPath}.bak`,
+      (input) => DelegationSnapshotSchema.parse(input),
+    )).value;
   }
 
   private async loadActiveJob(id: string): Promise<ActiveDelegation> {
@@ -1093,8 +1160,109 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       jobDirectory,
       snapshot,
       cancelRequested: false,
+      updateQueue: Promise.resolve(),
     };
     this.active.set(id, job);
     return job;
+  }
+
+  private async diagnoseOne(id: string): Promise<DelegationDiagnostic> {
+    const jobDirectory = path.join(this.delegationsRoot, id);
+    const taskPath = path.join(jobDirectory, "task.json");
+    const statusPath = path.join(jobDirectory, "status.json");
+    const backupPath = `${statusPath}.bak`;
+    const [task, status, backup, taskEvidence, statusEvidence, backupEvidence] = await Promise.all([
+      inspectJsonFile(taskPath, (input) => TaskSpecSchema.parse(input)),
+      inspectJsonFile(statusPath, (input) => DelegationSnapshotSchema.parse(input)),
+      inspectJsonFile(backupPath, (input) => DelegationSnapshotSchema.parse(input)),
+      listCorruptEvidence(taskPath),
+      listCorruptEvidence(statusPath),
+      listCorruptEvidence(backupPath),
+    ]);
+    const recoveredStatus = status.state === "valid" ? status.value : backup.value;
+    const repositoryPath = task.value?.repository_path ?? recoveredStatus?.repository_path;
+    const worktreePath = task.value?.worktree_path ?? recoveredStatus?.worktree_path;
+    const branch = task.value?.branch ?? recoveredStatus?.branch;
+    const repositoryExists = repositoryPath ? await pathExists(repositoryPath) : undefined;
+    const worktreeExists = worktreePath ? await pathExists(worktreePath) : undefined;
+    let branchExists: boolean | undefined;
+    let worktreeRegistered: boolean | undefined;
+    if (repositoryPath && repositoryExists && branch && worktreePath) {
+      try {
+        [branchExists, worktreeRegistered] = await Promise.all([
+          gitBranchExists(repositoryPath, branch),
+          isRegisteredWorktree(repositoryPath, worktreePath),
+        ]);
+      } catch {
+        branchExists = false;
+        worktreeRegistered = false;
+      }
+    }
+
+    const issues: string[] = [];
+    const remediation: string[] = [];
+    if (task.state !== "valid") {
+      issues.push(`task.json is ${task.state}`);
+      remediation.push("Preserve the delegation directory and restore task.json from a known-good copy; do not reconstruct its contract by guessing.");
+    }
+    if (status.state !== "valid") {
+      issues.push(`status.json is ${status.state}`);
+      if (backup.state === "valid") {
+        issues.push("status.json.bak is valid and is used as the read-only recovery source");
+        remediation.push("Inspect the backup and corrupt evidence before the next mutation; a later atomic write preserves the corrupt primary before replacing it.");
+      } else {
+        issues.push(`status.json.bak is ${backup.state}`);
+        remediation.push("Preserve all artifacts and restore status.json from a known-good external copy; automatic recovery is unavailable.");
+      }
+    }
+    if (repositoryPath && repositoryExists === false) {
+      issues.push("repository path does not exist");
+      remediation.push("Restore or relocate the repository manually before attempting worker operations.");
+    }
+    const worktreeRemoved = recoveredStatus?.worktree_removed_at !== undefined;
+    if (worktreePath && worktreeExists === false && !worktreeRemoved) {
+      issues.push("worker worktree does not exist and was not recorded as cleaned");
+      remediation.push("Inspect Git worktree metadata and retained artifacts; do not recreate a worktree at the recorded path automatically.");
+    }
+    if (worktreeExists === true && worktreeRegistered === false) {
+      issues.push("worker worktree exists but is not registered with Git");
+      remediation.push("Inspect the existing directory and Git worktree metadata before any manual registration or cleanup.");
+    }
+    if (branch && branchExists === false) {
+      issues.push("worker branch does not exist");
+      remediation.push("Recover the branch from a retained commit SHA or backup only after verifying the repository and delegation identity.");
+    }
+    return {
+      worker_id: id,
+      healthy: issues.length === 0,
+      task_file: {
+        path: taskPath,
+        primary_state: task.state,
+        ...(task.error ? { error: task.error } : {}),
+        corrupt_evidence_paths: taskEvidence,
+      },
+      status_file: {
+        path: statusPath,
+        primary_state: status.state,
+        backup_path: backupPath,
+        backup_state: backup.state,
+        ...(status.state === "valid"
+          ? { recovery_source: "primary" as const }
+          : backup.state === "valid"
+            ? { recovery_source: "backup" as const }
+            : {}),
+        ...(status.error ?? backup.error ? { error: status.error ?? backup.error } : {}),
+        corrupt_evidence_paths: [...statusEvidence, ...backupEvidence],
+      },
+      ...(repositoryPath ? { repository_path: repositoryPath } : {}),
+      ...(worktreePath ? { worktree_path: worktreePath } : {}),
+      ...(branch ? { branch } : {}),
+      ...(repositoryExists !== undefined ? { repository_exists: repositoryExists } : {}),
+      ...(worktreeExists !== undefined ? { worktree_exists: worktreeExists } : {}),
+      ...(worktreeRegistered !== undefined ? { worktree_registered: worktreeRegistered } : {}),
+      ...(branchExists !== undefined ? { branch_exists: branchExists } : {}),
+      issues,
+      safe_remediation: remediation,
+    };
   }
 }

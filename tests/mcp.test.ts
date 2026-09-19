@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -570,12 +570,174 @@ test("server restart marks a worker interrupted and resumes without spending a r
   }
 });
 
+test("truncated status recovers from backup and preserves corrupt evidence before repair", async () => {
+  const fixture = await createRepository("harness-persistence-recovery-");
+  const worker: Worker = {
+    async run(task: TaskSpec) {
+      await mkdir(path.join(task.worktree_path, "src"), { recursive: true });
+      await writeFile(path.join(task.worktree_path, "src", "result.txt"), "done\n", "utf8");
+      return {
+        result: {
+          status: "success", summary: "done", files_changed: ["src/result.txt"], checks_attempted: [], residual_risks: [],
+        },
+        process: processResult(task.worktree_path),
+      };
+    },
+  };
+  try {
+    const firstServer = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const started = await firstServer.delegate({
+      repository_path: fixture.repoPath,
+      objective: "Persistence recovery task",
+      allowed_paths: ["src/result.txt"],
+      acceptance_criteria: ["done"],
+      checks: [],
+    });
+    await waitForState(firstServer, started.id, "COMPLETED");
+    const delegationDirectory = path.join(fixture.harnessRoot, ".harness", "delegations", started.id);
+    const statusPath = path.join(delegationDirectory, "status.json");
+    await access(`${statusPath}.bak`);
+    await writeFile(statusPath, '{"state":"COMP', "utf8");
+
+    const restartedServer = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const recovered = await restartedServer.getStatus(started.id);
+    assert.ok(recovered.id === started.id);
+    const beforeRepair = (await restartedServer.diagnose(started.id))[0]!;
+    assert.equal(beforeRepair.status_file.primary_state, "corrupt");
+    assert.equal(beforeRepair.status_file.backup_state, "valid");
+    assert.equal(beforeRepair.status_file.recovery_source, "backup");
+
+    await restartedServer.initialize();
+    const repaired = await restartedServer.getStatus(started.id);
+    assert.equal(repaired.state, "INTERRUPTED");
+    const afterRepair = (await restartedServer.diagnose(started.id))[0]!;
+    assert.equal(afterRepair.status_file.primary_state, "valid");
+    assert.equal(afterRepair.status_file.corrupt_evidence_paths.length, 1);
+    assert.equal(await readFile(afterRepair.status_file.corrupt_evidence_paths[0]!, "utf8"), '{"state":"COMP');
+    assert.deepEqual(
+      (await readdir(delegationDirectory)).filter((entry) => entry.endsWith(".tmp")),
+      [],
+    );
+  } finally {
+    await rm(fixture.tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("diagnostics expose corrupt task files and both-unrecoverable status copies", async () => {
+  const fixture = await createRepository("harness-persistence-diagnostics-");
+  const worker: Worker = {
+    async run(task: TaskSpec) {
+      await mkdir(path.join(task.worktree_path, "src"), { recursive: true });
+      await writeFile(path.join(task.worktree_path, "src", "diagnostic.txt"), "done\n", "utf8");
+      return {
+        result: {
+          status: "success", summary: "done", files_changed: ["src/diagnostic.txt"], checks_attempted: [], residual_risks: [],
+        },
+        process: processResult(task.worktree_path),
+      };
+    },
+  };
+  try {
+    const firstServer = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const started = await firstServer.delegate({
+      repository_path: fixture.repoPath,
+      objective: "Broken persistence task",
+      allowed_paths: ["src/**"],
+      acceptance_criteria: ["done"],
+      checks: [],
+    });
+    await waitForState(firstServer, started.id, "COMPLETED");
+    const delegationDirectory = path.join(fixture.harnessRoot, ".harness", "delegations", started.id);
+    const taskPath = path.join(delegationDirectory, "task.json");
+    const statusPath = path.join(delegationDirectory, "status.json");
+    await writeFile(taskPath, "not-json", "utf8");
+    await writeFile(statusPath, "not-json", "utf8");
+    await writeFile(`${statusPath}.bak`, "also-not-json", "utf8");
+
+    const restartedServer = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const allDiagnostics = await restartedServer.diagnose();
+    const diagnostic = allDiagnostics.find((entry) => entry.worker_id === started.id);
+    assert.ok(diagnostic);
+    assert.equal(diagnostic.task_file.primary_state, "corrupt");
+    assert.equal(diagnostic.status_file.primary_state, "corrupt");
+    assert.equal(diagnostic.status_file.backup_state, "corrupt");
+    assert.equal(diagnostic.status_file.recovery_source, undefined);
+    assert.match(diagnostic.safe_remediation.join(" "), /Preserve all artifacts/);
+    await assert.rejects(restartedServer.getStatus(started.id), /Cannot recover/);
+
+    const warnings: string[] = [];
+    const originalError = console.error;
+    console.error = (...values: unknown[]) => warnings.push(values.map(String).join(" "));
+    try {
+      await restartedServer.initialize();
+    } finally {
+      console.error = originalError;
+    }
+    assert.match(warnings.join(" "), new RegExp(started.id));
+  } finally {
+    await rm(fixture.tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("restart ignores an unrenamed temporary status and keeps normal delegations unchanged", async () => {
+  const fixture = await createRepository("harness-persistence-atomic-");
+  const worker: Worker = {
+    async run(task: TaskSpec) {
+      await mkdir(path.join(task.worktree_path, "src"), { recursive: true });
+      await writeFile(path.join(task.worktree_path, "src", "atomic.txt"), "done\n", "utf8");
+      return {
+        result: {
+          status: "success", summary: "done", files_changed: ["src/atomic.txt"], checks_attempted: [], residual_risks: [],
+        },
+        process: processResult(task.worktree_path),
+      };
+    },
+  };
+  try {
+    const firstServer = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const started = await firstServer.delegate({
+      repository_path: fixture.repoPath,
+      objective: "Atomic restart task",
+      allowed_paths: ["src/**"],
+      acceptance_criteria: ["done"],
+      checks: [],
+    });
+    await waitForState(firstServer, started.id, "COMPLETED");
+    const delegationDirectory = path.join(fixture.harnessRoot, ".harness", "delegations", started.id);
+    const statusPath = path.join(delegationDirectory, "status.json");
+    await writeFile(`${statusPath}.bak`, "corrupt-backup", "utf8");
+    await firstServer.requestRevision(started.id, "Verify backup rotation");
+    const revised = await waitForState(firstServer, started.id, "COMPLETED");
+    const beforeRestartDiagnostic = (await firstServer.diagnose(started.id))[0]!;
+    assert.equal(beforeRestartDiagnostic.status_file.corrupt_evidence_paths.length, 1);
+    assert.equal(
+      await readFile(beforeRestartDiagnostic.status_file.corrupt_evidence_paths[0]!, "utf8"),
+      "corrupt-backup",
+    );
+    await writeFile(
+      path.join(delegationDirectory, ".status.json.interrupted.tmp"),
+      `${JSON.stringify({ ...revised, state: "FAILED" })}\n`,
+      "utf8",
+    );
+
+    const restartedServer = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    await restartedServer.initialize();
+    assert.equal((await restartedServer.getStatus(started.id)).state, "COMPLETED");
+    const diagnostic = (await restartedServer.diagnose(started.id))[0]!;
+    assert.equal(diagnostic.healthy, true);
+    assert.equal(diagnostic.status_file.recovery_source, "primary");
+  } finally {
+    await rm(fixture.tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("MCP server publishes the chat-native delegation toolset", async () => {
   assert.match(SERVER_INSTRUCTIONS, /explicitly approved the plan/);
   assert.match(SERVER_INSTRUCTIONS, /only planner and reviewer/);
   const unavailable = async (): Promise<never> => { throw new Error("not used"); };
   const service: InteractiveDelegationApi = {
     list: unavailable,
+    diagnose: unavailable,
     delegate: unavailable,
     getStatus: unavailable,
     getMetrics: unavailable,
@@ -599,6 +761,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
       "cancel_worker",
       "cleanup_worker",
       "delegate_to_antigravity",
+      "diagnose_delegation",
       "get_worker_diff",
       "get_worker_metrics",
       "get_worker_result",

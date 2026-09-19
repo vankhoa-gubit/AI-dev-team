@@ -59,6 +59,7 @@ handoff mutations.
 
 - `delegate_to_antigravity`: create a bounded asynchronous worker in an isolated worktree.
 - `list_workers`: list persisted delegations, optionally filtered by repository.
+- `diagnose_delegation`: inspect one or all delegation directories, including corrupt JSON, backup recovery, and Git resource health.
 - `get_worker_status`: read current state and quota-oriented attempt metrics.
 - `get_worker_metrics`: read measured attempt history, timings, reuse, and failure categories.
 - `wait_for_worker`: wait for a terminal state or bounded timeout without repeated Codex polling.
@@ -72,6 +73,8 @@ handoff mutations.
 - `cancel_worker`: stop an active worker while preserving its artifacts.
 
 Delegation artifacts live under `.harness/delegations/<worker-id>`. If the MCP server restarts during execution, the persisted delegation becomes `INTERRUPTED` when its worktree is available. Codex can call `resume_worker` without consuming the review revision budget.
+
+`task.json` and `status.json` are written through a flushed same-directory temporary file and atomic rename. Before replacing a valid status, the harness keeps it as `status.json.bak`. Reads fall back to that backup when the primary is missing or corrupt. A later mutation preserves a corrupt primary as `status.json.corrupt.<timestamp>.<id>` before replacing it; the harness never silently deletes corrupt evidence. Use `diagnose_delegation` before manual recovery.
 
 ## Task contract
 
