@@ -136,3 +136,10 @@ export interface WorkerRunResult {
   result: WorkerResult;
   process: ProcessResult;
 }
+
+export interface WorkerLogRecord {
+  id: number;
+  timestamp: string;
+  type: string;
+  [key: string]: unknown;
+}

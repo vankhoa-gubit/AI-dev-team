@@ -12,10 +12,10 @@ The harness does not invoke Codex CLI, use a model gateway, plan autonomously, r
 3. After approval, Codex passes the returned `contract_hash` as
    `preview_contract_hash`; the harness rejects contract or repository HEAD drift,
    then creates an isolated branch and Git worktree.
-4. Antigravity implements the task.
-5. Codex uses a bounded `wait_for_worker` call instead of repeatedly polling status.
+4. Antigravity implements the task using `--output-format stream-json`. Logs are parsed across arbitrary chunk boundaries, sanitized, and appended in order to bounded per-attempt JSONL artifacts.
+5. Codex uses delta long-polling with `wait_for_worker` (passing `after_revision`) instead of repeatedly polling full status snapshots. If unchanged upon timeout, it returns a compact response. UI consumers can stream sanitized log events directly via the opt-in localhost-only SSE endpoint.
 6. The harness rejects denied actions, empty changes, out-of-scope files, and failed checks.
-7. Codex reads the deterministic review packet and every paginated diff page, then either requests a revision or prepares a cherry-pick handoff.
+7. Codex inspects the metadata-first review packet (gates, diff statistics, validation evidence) and only requests diff pages (using `include_diff: true` or specific paths) when needed, then either requests a revision or prepares a cherry-pick handoff.
 8. You explicitly decide whether to run the returned cherry-pick command.
 9. After handoff, Codex can preview and explicitly confirm removal of only the clean worker worktree.
 
@@ -72,6 +72,27 @@ The server instructions require explicit user approval of the plan before
 available without weakening approval for worker, revision, cancellation, or
 handoff mutations.
 
+### Opt-in Localhost-Only SSE Log Endpoint
+
+For external UI consumers that wish to stream live execution logs directly without consuming Codex context quota, the MCP server provides an opt-in native Node HTTP SSE endpoint. It is disabled by default and strictly binds only to `127.0.0.1`:
+
+```powershell
+node dist/mcp-server.js --enable-sse --sse-port 20129
+```
+
+If the UI is served from a different local origin, allow that exact origin explicitly:
+
+```powershell
+node dist/mcp-server.js --enable-sse --sse-port 20129 --sse-origin http://127.0.0.1:3000
+```
+
+Cross-origin browser access is denied by default; the endpoint never sends a wildcard CORS header.
+
+- Endpoint: `GET http://127.0.0.1:20129/workers/:worker_id/events?cursor=:cursor`
+- Supports `Last-Event-ID` or `?cursor=` for historical replay and resuming disconnects.
+- Emits sanitized, bounded JSON log events with monotonic cursor IDs and keepalives.
+- Supports disconnect cancellation and write backpressure.
+
 ## MCP tools
 
 - `delegate_to_antigravity`: create a bounded asynchronous worker in an isolated worktree.
@@ -82,13 +103,13 @@ handoff mutations.
 - `diagnose_delegation`: inspect one or all delegation directories, including corrupt JSON, backup recovery, and Git resource health.
 - `get_worker_status`: read current state and quota-oriented attempt metrics.
 - `get_worker_metrics`: read measured attempt history, timings, reuse, and failure categories.
-- `wait_for_worker`: wait for a terminal state or bounded timeout without repeated Codex polling.
+- `wait_for_worker`: wait until a delegated worker reaches a non-active state, advances `status_revision` past `after_revision`, or times out. Pass `after_revision` for compact unchanged responses without full snapshots.
 - `get_worker_result`: read the terminal worker result and validation evidence.
 - `get_worker_diff`: return a size-bounded Git diff, including untracked files.
-- `get_worker_review_packet`: return task context, scope and validation gates,
-  diff statistics, residual risks, warnings, and a cursor-paginated diff for
-  quota-efficient Codex review. Supply `path` to focus a changed file and pass
-  `next_cursor` back as `cursor` until no next cursor remains.
+- `get_worker_review_packet`: return metadata-first review packet with task context,
+  scope and validation gates, diff statistics, warnings, and residual risks. Diff text
+  is omitted by default for quota efficiency; pass `include_diff: true` or `path`/`cursor`
+  to fetch bounded paginated diff pages.
 - `resume_worker`: resume an interrupted worker without consuming a revision round.
 - `request_worker_revision`: resume the same Antigravity conversation with review feedback.
 - `prepare_worker_cherry_pick`: re-run safety gates, commit the isolated branch, and return a command without changing the target checkout.

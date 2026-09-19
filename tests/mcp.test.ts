@@ -6,17 +6,26 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
-import { parseAntigravityOutput, type Worker } from "../src/adapters/antigravity.js";
+import {
+  parseAntigravityOutput,
+  sanitizeLogRecord,
+  StreamJsonParser,
+  workerLogEmitter,
+  type Worker,
+} from "../src/adapters/antigravity.js";
 import { HarnessConfigSchema, type HarnessConfig } from "../src/config.js";
 import { classifyDoctorFailure, runDeepDoctor } from "../src/doctor.js";
 import { findOutOfScopeFiles } from "../src/git.js";
 import {
   DelegationRequestSchema,
+  DelegationSnapshotSchema,
   InteractiveDelegationService,
   type DelegationSnapshot,
   type InteractiveDelegationApi,
 } from "../src/interactive-delegation.js";
 import { createInteractiveMcpServer, SERVER_INSTRUCTIONS } from "../src/mcp-server.js";
+import { runProcess } from "../src/process.js";
+import { startSseServer, createSseServer, type SseServerInstance } from "../src/sse-server.js";
 import { findOverlappingScope } from "../src/scope.js";
 import type { ProcessResult, TaskSpec, WorkerRunResult } from "../src/types.js";
 import { assertAllowedValidationCommand } from "../src/validation.js";
@@ -309,7 +318,14 @@ test("chat delegation supports revision, bounded diff, persistence, and safe che
     assert.match(diff.diff, /\+done/);
     assert.equal(diff.truncated, false);
 
+    const metadataOnlyReview = await service.getReviewPacket(started.id);
+    assert.equal(metadataOnlyReview.review_ready, true);
+    assert.deepEqual(metadataOnlyReview.changed_files, ["src/result.txt"]);
+    assert.equal(metadataOnlyReview.diff_page, undefined);
+    assert.match(metadataOnlyReview.warnings.join(" "), /Diff text omitted by default/i);
+
     const firstReviewPage = await service.getReviewPacket(started.id, {
+      includeDiff: true,
       maxBytes: 1_024,
       maxLines: 4,
     });
@@ -323,18 +339,18 @@ test("chat delegation supports revision, bounded diff, persistence, and safe che
     assert.equal(firstReviewPage.budget_gate.passed, true);
     assert.equal(firstReviewPage.diff_stat.files_changed, 1);
     assert.equal(firstReviewPage.diff_stat.additions, 1);
-    assert.ok(firstReviewPage.diff_page.next_cursor);
+    assert.ok(firstReviewPage.diff_page?.next_cursor);
     assert.match(firstReviewPage.warnings.join(" "), /paginated/i);
 
     const focusedReview = await service.getReviewPacket(started.id, {
       path: "src/result.txt",
-      cursor: firstReviewPage.diff_page.next_cursor,
+      cursor: firstReviewPage.diff_page?.next_cursor,
       maxBytes: 1_024,
       maxLines: 100,
     });
-    assert.equal(focusedReview.diff_page.path, "src/result.txt");
-    assert.match(focusedReview.diff_page.text, /\+done/);
-    assert.equal(focusedReview.diff_page.next_cursor, undefined);
+    assert.equal(focusedReview.diff_page?.path, "src/result.txt");
+    assert.match(focusedReview.diff_page?.text ?? "", /\+done/);
+    assert.equal(focusedReview.diff_page?.next_cursor, undefined);
     await assert.rejects(
       service.getReviewPacket(started.id, { path: "README.md" }),
       /not a changed file/,
@@ -570,6 +586,10 @@ test("worker waiting returns terminal state and reports bounded timeout", async 
     const fast = await service.delegate(request);
     const completed = await service.waitForWorker(fast.id, 2_000);
     assert.equal(completed.timed_out, false);
+    assert.equal(completed.changed, true);
+    if (!completed.changed) {
+      assert.fail("expected snapshot in completed wait response");
+    }
     assert.equal(completed.snapshot.state, "COMPLETED");
 
     const slow = await service.delegate({
@@ -579,8 +599,13 @@ test("worker waiting returns terminal state and reports bounded timeout", async 
     });
     const timedOut = await service.waitForWorker(slow.id, 20);
     assert.equal(timedOut.timed_out, true);
+    assert.equal(timedOut.changed, true);
+    if (!timedOut.changed) {
+      assert.fail("expected snapshot in legacy timed out wait response");
+    }
     assert.equal(timedOut.snapshot.state, "WORKER_RUNNING");
     await service.cancel(slow.id);
+    await service.waitForWorker(slow.id, 2_000);
   } finally {
     await rm(fixture.tempRoot, { recursive: true, force: true });
   }
@@ -983,5 +1008,443 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
   } finally {
     await client.close();
     await server.close();
+  }
+});
+
+test("StreamJsonParser parses chunks across arbitrary boundaries and handles records", () => {
+  const events: any[] = [];
+  const parser = new StreamJsonParser({
+    onEvent: (event) => events.push(event),
+  });
+
+  const part1 = '{"type":"init","conversation_id":"conv-abc"}\n{"type":"step_up';
+  const part2 = 'date","step":1,"thought":"analyzing"}\n{"type":"result","status":"SUCCESS","struc';
+  const part3 = 'tured_output":{"status":"success","summary":"done","files_changed":["src/index.ts"],"checks_attempted":["check-1"],"residual_risks":[]}}\n';
+
+  parser.feed(part1);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, "init");
+  assert.equal(events[0].conversation_id, "conv-abc");
+
+  parser.feed(part2);
+  assert.equal(events.length, 2);
+  assert.equal(events[1].type, "step_update");
+  assert.equal(events[1].step, 1);
+
+  parser.feed(part3);
+  assert.equal(events.length, 3);
+  assert.equal(events[2].type, "result");
+
+  const finished = parser.finish();
+  assert.equal(finished.conversationId, "conv-abc");
+  assert.equal(finished.workerResult.status, "success");
+  assert.equal(finished.workerResult.conversation_id, "conv-abc");
+  assert.deepEqual(finished.workerResult.files_changed, ["src/index.ts"]);
+
+  const nestedEvents: any[] = [];
+  const nestedParser = new StreamJsonParser({
+    initialEventId: 1_000_000,
+    onEvent: (event) => nestedEvents.push(event),
+  });
+  nestedParser.feed('{"event":"init","conversation_id":"conv-nested"}\n');
+  nestedParser.feed('{"event":"result","result":{"status":"SUCCESS","structured_output":{"status":"success","summary":"nested","files_changed":[],"checks_attempted":[],"residual_risks":[]}}}\n');
+  const nestedResult = nestedParser.finish();
+  assert.equal(nestedEvents[0].id, 1_000_001);
+  assert.equal(nestedEvents[1].type, "result");
+  assert.equal(nestedResult.workerResult.summary, "nested");
+  assert.equal(nestedResult.conversationId, "conv-nested");
+});
+
+test("StreamJsonParser fails safely on malformed, oversized, denied, and missing-result streams", () => {
+  // Malformed JSON
+  assert.throws(() => {
+    const parser = new StreamJsonParser();
+    parser.feed('{"type":"step_update", broken\n');
+  }, /malformed JSON/);
+
+  // Oversized line
+  assert.throws(() => {
+    const parser = new StreamJsonParser({ maxLineBytes: 100 });
+    parser.feed(`{"type":"step_update","huge":"${"x".repeat(200)}"}\n`);
+  }, /exceeded maximum line size/);
+
+  // Oversized unterminated line must fail before the buffer can grow without bound.
+  assert.throws(() => {
+    const parser = new StreamJsonParser({ maxLineBytes: 100 });
+    parser.feed("x".repeat(101));
+  }, /exceeded maximum line size/);
+
+  // Soft-denied action
+  assert.throws(() => {
+    const parser = new StreamJsonParser();
+    parser.feed('{"type":"result","status":"SUCCESS","denied_actions":[{"tool":"cmd"}],"structured_output":{"status":"success","summary":"","files_changed":[],"checks_attempted":[],"residual_risks":[]}}\n');
+  }, /denied required actions/);
+
+  // Missing result record
+  assert.throws(() => {
+    const parser = new StreamJsonParser();
+    parser.feed('{"type":"init","conversation_id":"conv-1"}\n{"type":"step_update","step":1}\n');
+    parser.finish();
+  }, /missing result record|ended without a valid result/);
+});
+
+test("sanitizeLogRecord redacts secrets and truncates oversized strings", () => {
+  const input = {
+    authHeader: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secretToken",
+    apiKey: "AIzaSyD-123456789012345678901234567",
+    ghToken: "ghp_123456789012345678901234567890123456",
+    api_key: "arbitrary-provider-credential",
+    password: "super_secret_password",
+    longString: "A".repeat(50_000),
+    nested: {
+      secret_token: "nested_secret_value",
+      normal: "hello world",
+    },
+  };
+
+  const sanitized = sanitizeLogRecord(input, 1000) as any;
+  assert.match(sanitized.authHeader, /Bearer \[REDACTED\]/);
+  assert.match(sanitized.apiKey, /\[REDACTED_API_KEY\]/);
+  assert.match(sanitized.ghToken, /\[REDACTED_GH_TOKEN\]/);
+  assert.equal(sanitized.api_key, "[REDACTED]");
+  assert.equal(sanitized.password, "[REDACTED]");
+  assert.equal(sanitized.nested.secret_token, "[REDACTED]");
+  assert.equal(sanitized.nested.normal, "hello world");
+  assert.ok(sanitized.longString.includes("[truncated]"));
+});
+
+test("runProcess waits for asynchronous stream callbacks and stops on callback failure", async () => {
+  let callbackFinished = false;
+  const ordered = await runProcess(
+    process.execPath,
+    ["-e", "process.stdout.write('first');setTimeout(()=>process.stdout.write('second'),20)"],
+    {
+      cwd: process.cwd(),
+      timeoutMs: 5_000,
+      onStdoutChunk: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        callbackFinished = true;
+      },
+    },
+  );
+  assert.equal(ordered.exitCode, 0);
+  assert.equal(callbackFinished, true);
+
+  await assert.rejects(
+    runProcess(
+      process.execPath,
+      ["-e", "process.stdout.write('fail');setInterval(()=>{},1000)"],
+      {
+        cwd: process.cwd(),
+        timeoutMs: 5_000,
+        onStdoutChunk: async () => {
+          throw new Error("stream callback failed");
+        },
+      },
+    ),
+    /stream callback failed/,
+  );
+});
+
+test("delegation snapshots maintain monotonic status_revision and backward compatibility", async () => {
+  // Test backward compatibility: snapshot without status_revision parses with default 0
+  const legacyRaw = {
+    id: "delegation-legacy-1",
+    state: "COMPLETED",
+    objective: "Legacy snapshot test",
+    repository_path: "D:/repo",
+    worktree_path: "D:/repo/worktree",
+    branch: "harness/legacy",
+    revision_round: 0,
+    max_revision_rounds: 2,
+    message: "Completed",
+    updated_at: new Date().toISOString(),
+  };
+  const parsed = DelegationSnapshotSchema.parse(legacyRaw);
+  assert.equal(parsed.status_revision, 0);
+
+  // Test monotonic advancement across state updates
+  const fixture = await createRepository("harness-revisions-");
+  const worker: Worker = {
+    async run(task: TaskSpec) {
+      await mkdir(path.join(task.worktree_path, "src"), { recursive: true });
+      await writeFile(path.join(task.worktree_path, "src", "rev.txt"), "rev\n", "utf8");
+      return {
+        result: {
+          status: "success",
+          summary: "done",
+          files_changed: ["src/rev.txt"],
+          checks_attempted: [],
+          residual_risks: [],
+          conversation_id: "conv-rev",
+        },
+        process: processResult(task.worktree_path),
+      };
+    },
+  };
+
+  try {
+    const service = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const started = await service.delegate({
+      repository_path: fixture.repoPath,
+      objective: "Revision test",
+      allowed_paths: ["src/**"],
+      acceptance_criteria: ["done"],
+      checks: [],
+    });
+    assert.ok((started.status_revision ?? 0) >= 1);
+
+    const completed = await waitForState(service, started.id, "COMPLETED");
+    assert.ok((completed.status_revision ?? 0) > (started.status_revision ?? 0));
+  } finally {
+    await rm(fixture.tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("wait_for_worker with after_revision wakes on change and returns compact unchanged timeout", async () => {
+  const fixture = await createRepository("harness-wait-revision-");
+  let releaseWorker: (() => void) | undefined;
+  let signalWorkerStarted: (() => void) | undefined;
+  const workerStarted = new Promise<void>((resolve) => {
+    signalWorkerStarted = resolve;
+  });
+  let service: InteractiveDelegationService | undefined;
+  let workerId: string | undefined;
+
+  const worker: Worker = {
+    async run(task: TaskSpec) {
+      await new Promise<void>((resolve) => {
+        releaseWorker = resolve;
+        signalWorkerStarted?.();
+      });
+      await mkdir(path.join(task.worktree_path, "src"), { recursive: true });
+      await writeFile(path.join(task.worktree_path, "src", "result.txt"), "done\n", "utf8");
+      return {
+        result: {
+          status: "success",
+          summary: "done",
+          files_changed: ["src/result.txt"],
+          checks_attempted: [],
+          residual_risks: [],
+        },
+        process: processResult(task.worktree_path),
+      };
+    },
+  };
+
+  try {
+    service = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const started = await service.delegate({
+      repository_path: fixture.repoPath,
+      objective: "Wait delta test",
+      allowed_paths: ["src/**"],
+      acceptance_criteria: ["done"],
+      checks: [],
+    });
+    workerId = started.id;
+    await workerStarted;
+
+    const running = await service.getStatus(started.id);
+    const currentRevision = running.status_revision;
+
+    // Timeout when after_revision equals current revision and nothing changed:
+    const unchangedTimeout = await service.waitForWorker(started.id, 50, currentRevision);
+    assert.equal(unchangedTimeout.timed_out, true);
+    assert.equal(unchangedTimeout.changed, false);
+    if (unchangedTimeout.changed) {
+      assert.fail("expected compact response without snapshot");
+    }
+    assert.equal(unchangedTimeout.worker_id, started.id);
+    assert.equal(unchangedTimeout.status_revision, currentRevision);
+    assert.equal(unchangedTimeout.state, "WORKER_RUNNING");
+
+    // Release worker and wait for revision advancement:
+    releaseWorker?.();
+    let advanced = await service.waitForWorker(started.id, 5_000, currentRevision);
+    assert.equal(advanced.timed_out, false);
+    assert.equal(advanced.changed, true);
+    if (!advanced.changed) {
+      assert.fail("expected snapshot in advanced result");
+    }
+    assert.ok(advanced.snapshot);
+    assert.ok((advanced.snapshot.status_revision ?? 0) > currentRevision);
+    if (advanced.snapshot.state !== "COMPLETED") {
+      advanced = await service.waitForWorker(
+        started.id,
+        5_000,
+        advanced.snapshot.status_revision,
+      );
+      assert.equal(advanced.timed_out, false);
+      assert.equal(advanced.changed, true);
+      if (!advanced.changed) {
+        assert.fail("expected terminal snapshot after checking revision");
+      }
+    }
+    assert.equal(advanced.snapshot.state, "COMPLETED");
+  } finally {
+    releaseWorker?.();
+    if (service && workerId) {
+      await service.waitForWorker(workerId, 5_000);
+    }
+    await rm(fixture.tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("SSE endpoint enforces localhost-only binding and validates inputs", async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "harness-sse-test-"));
+  const delegationsRoot = path.join(tempRoot, "delegations");
+  await mkdir(delegationsRoot, { recursive: true });
+
+  let sseInstance: SseServerInstance | undefined;
+  try {
+    // Rejects non-127.0.0.1 host
+    assert.throws(
+      () => createSseServer({ delegationsRoot, host: "0.0.0.0" as any }),
+      /SSE server can only bind to 127.0.0.1/,
+    );
+    assert.throws(
+      () => createSseServer({ delegationsRoot, allowedOrigins: ["not-an-origin"] }),
+      /Invalid URL|Invalid SSE allowed origin/,
+    );
+
+    sseInstance = await startSseServer({
+      delegationsRoot,
+      port: 0,
+      host: "127.0.0.1",
+      allowedOrigins: ["http://127.0.0.1:3000"],
+    });
+
+    assert.equal(sseInstance.host, "127.0.0.1");
+    assert.ok(sseInstance.port > 0);
+
+    // Health check
+    const healthRes = await fetch(`${sseInstance.url}/health`);
+    assert.equal(healthRes.status, 200);
+    assert.equal(healthRes.headers.get("access-control-allow-origin"), null);
+
+    const blockedOrigin = await fetch(`${sseInstance.url}/health`, {
+      headers: { Origin: "https://untrusted.example" },
+    });
+    assert.equal(blockedOrigin.status, 403);
+
+    const allowedOrigin = await fetch(`${sseInstance.url}/health`, {
+      headers: { Origin: "http://127.0.0.1:3000" },
+    });
+    assert.equal(allowedOrigin.status, 200);
+    assert.equal(
+      allowedOrigin.headers.get("access-control-allow-origin"),
+      "http://127.0.0.1:3000",
+    );
+
+    // Invalid worker ID
+    const badWorkerRes = await fetch(`${sseInstance.url}/workers/invalid_worker!/events`);
+    assert.equal(badWorkerRes.status, 400);
+
+    // Missing worker ID
+    const missingWorkerRes = await fetch(`${sseInstance.url}/events`);
+    assert.equal(missingWorkerRes.status, 400);
+
+    // Nonexistent worker ID
+    const notFoundRes = await fetch(`${sseInstance.url}/workers/delegation-20260101000000-deadbeef/events`);
+    assert.equal(notFoundRes.status, 404);
+
+    // Invalid cursor
+    const badCursorRes = await fetch(`${sseInstance.url}/workers/delegation-20260101000000-deadbeef/events?cursor=-5`);
+    assert.equal(badCursorRes.status, 400);
+  } finally {
+    if (sseInstance) {
+      await sseInstance.close();
+    }
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("SSE endpoint streams historical and live events with cursor ids and handles disconnect", async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "harness-sse-stream-"));
+  const delegationsRoot = path.join(tempRoot, "delegations");
+  const workerId = "delegation-20260101000000-test0001";
+  const workerDir = path.join(delegationsRoot, workerId);
+  await mkdir(workerDir, { recursive: true });
+
+  // Write historical events to JSONL artifact
+  const historicalEvents = [
+    { id: 1, type: "init", timestamp: new Date().toISOString(), conversation_id: "conv-1" },
+    { id: 2, type: "step_update", timestamp: new Date().toISOString(), step: 1 },
+    { id: 3, type: "step_update", timestamp: new Date().toISOString(), step: 2 },
+  ];
+  await writeFile(
+    path.join(workerDir, "worker-attempt-1.events.jsonl"),
+    historicalEvents.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    "utf8",
+  );
+
+  let sseInstance: SseServerInstance | undefined;
+  let abortController: AbortController | undefined;
+  try {
+    sseInstance = await startSseServer({
+      delegationsRoot,
+      port: 0,
+      host: "127.0.0.1",
+      keepAliveIntervalMs: 500,
+    });
+
+    // Fetch events starting from cursor 1 (should return events 2 and 3)
+    abortController = new AbortController();
+    const res = await fetch(`${sseInstance.url}/workers/${workerId}/events?cursor=1`, {
+      signal: abortController.signal,
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "text/event-stream");
+
+    const reader = (res.body as any)?.getReader();
+    assert.ok(reader);
+    const decoder = new TextDecoder();
+    let streamText = "";
+
+    // Read initial historical chunk
+    while (!streamText.includes("id: 3")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      streamText += decoder.decode(value, { stream: true });
+    }
+
+    assert.ok(!streamText.includes("id: 1\n")); // cursor=1 filtered out event 1
+    assert.ok(streamText.includes("id: 2\n"));
+    assert.ok(streamText.includes("id: 3\n"));
+
+    // Emit live event
+    workerLogEmitter.emit(`worker:${workerId}`, {
+      id: 4,
+      type: "result",
+      timestamp: new Date().toISOString(),
+      status: "SUCCESS",
+    });
+
+    while (!streamText.includes("id: 4")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      streamText += decoder.decode(value, { stream: true });
+    }
+
+    assert.ok(streamText.includes("id: 4\n"));
+    assert.ok(streamText.includes("event: result\n"));
+
+    workerLogEmitter.emit(`worker:${workerId}`, {
+      id: 5,
+      type: "result\ndata: injected",
+      timestamp: new Date().toISOString(),
+    });
+    while (!streamText.includes("id: 5")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      streamText += decoder.decode(value, { stream: true });
+    }
+    assert.ok(streamText.includes("id: 5\nevent: message\n"));
+  } finally {
+    abortController?.abort();
+    if (sseInstance) {
+      await sseInstance.close();
+    }
+    await rm(tempRoot, { recursive: true, force: true });
   }
 });

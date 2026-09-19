@@ -205,6 +205,7 @@ const CheckEvidenceSchema = z.object({
 
 export const DelegationSnapshotSchema = z.object({
   id: z.string().min(1),
+  status_revision: z.number().int().min(0).default(0),
   state: DelegationStateSchema,
   objective: z.string(),
   repository_path: z.string(),
@@ -243,6 +244,7 @@ export interface ReviewPacketOptions {
   cursor?: number;
   maxBytes?: number;
   maxLines?: number;
+  includeDiff?: boolean;
 }
 
 export interface ReviewPacket {
@@ -290,7 +292,7 @@ export interface ReviewPacket {
   worker_summary?: string;
   residual_risks: string[];
   warnings: string[];
-  diff_page: {
+  diff_page?: {
     path?: string;
     cursor: number;
     next_cursor?: number;
@@ -312,10 +314,19 @@ export interface CherryPickHandoff {
   command: string;
 }
 
-export interface WaitWorkerResult {
-  timed_out: boolean;
-  snapshot: DelegationSnapshot;
-}
+export type WaitWorkerResult =
+  | {
+      changed: true;
+      timed_out: boolean;
+      snapshot: DelegationSnapshot;
+    }
+  | {
+      changed: false;
+      timed_out: true;
+      worker_id: string;
+      status_revision: number;
+      state: DelegationState;
+    };
 
 export type DelegationStartResult = DelegationSnapshot & {
   delegation_outcome: "created" | "reused";
@@ -421,7 +432,7 @@ export interface InteractiveDelegationApi {
   delegate(request: DelegationRequest): Promise<DelegationStartResult>;
   getStatus(id: string): Promise<DelegationSnapshot>;
   getMetrics(id: string): Promise<WorkerMetrics>;
-  waitForWorker(id: string, timeoutMs: number): Promise<WaitWorkerResult>;
+  waitForWorker(id: string, timeoutMs: number, afterRevision?: number): Promise<WaitWorkerResult>;
   getResult(id: string): Promise<DelegationSnapshot>;
   getDiff(id: string): Promise<DelegationDiff>;
   getReviewPacket(id: string, options?: ReviewPacketOptions): Promise<ReviewPacket>;
@@ -568,6 +579,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
   private readonly active = new Map<string, ActiveDelegation>();
   private readonly pendingDelegations = new Map<string, Promise<DelegationStartResult>>();
   private readonly cleanupAuthorizations = new Map<string, CleanupAuthorization>();
+  private readonly updateListeners = new Map<string, Set<(snapshot: DelegationSnapshot) => void>>();
   private readonly delegationsRoot: string;
 
   constructor(
@@ -577,6 +589,10 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     private readonly now: () => number = () => Date.now(),
   ) {
     this.delegationsRoot = path.resolve(harnessRoot, config.dataDirectory, "delegations");
+  }
+
+  getDelegationsRoot(): string {
+    return this.delegationsRoot;
   }
 
   async initialize(): Promise<void> {
@@ -894,6 +910,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     const now = new Date().toISOString();
     const snapshot: DelegationSnapshot = {
       id,
+      status_revision: 1,
       state: "PREPARING",
       objective: request.objective,
       repository_path: repositoryPath,
@@ -975,28 +992,173 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     };
   }
 
-  async waitForWorker(id: string, timeoutMs: number): Promise<WaitWorkerResult> {
+  async waitForWorker(id: string, timeoutMs: number, afterRevision?: number): Promise<WaitWorkerResult> {
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
       throw new Error("Worker wait timeout must be a non-negative finite number");
     }
-    const deadline = Date.now() + timeoutMs;
-    while (true) {
-      const snapshot = await this.loadSnapshot(id);
-      if (!isActive(snapshot.state)) {
-        return { timed_out: false, snapshot };
+
+    const initialSnapshot = await this.loadSnapshot(id);
+
+    if (afterRevision === undefined) {
+      if (!isActive(initialSnapshot.state)) {
+        const job = this.active.get(id);
+        if (job?.runPromise) {
+          try {
+            await job.runPromise;
+          } catch {
+            // Ignore
+          }
+        }
+        return { changed: true, timed_out: false, snapshot: initialSnapshot };
       }
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) {
-        return { timed_out: true, snapshot };
+      const deadline = Date.now() + timeoutMs;
+      while (true) {
+        const snapshot = await this.loadSnapshot(id);
+        if (!isActive(snapshot.state)) {
+          const job = this.active.get(id);
+          if (job?.runPromise) {
+            try {
+              await job.runPromise;
+            } catch {
+              // Ignore
+            }
+          }
+          return { changed: true, timed_out: false, snapshot };
+        }
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          return { changed: true, timed_out: true, snapshot };
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(100, remainingMs)));
       }
-      await new Promise((resolve) => setTimeout(resolve, Math.min(250, remainingMs)));
     }
+
+    // Delta long-polling mode
+    if (!isActive(initialSnapshot.state) || (initialSnapshot.status_revision ?? 0) > afterRevision) {
+      const job = this.active.get(id);
+      if (job?.runPromise && !isActive(initialSnapshot.state)) {
+        try {
+          await job.runPromise;
+        } catch {
+          // Ignore
+        }
+      }
+      return {
+        changed: true,
+        timed_out: false,
+        snapshot: initialSnapshot,
+      };
+    }
+
+    return await new Promise<WaitWorkerResult>((resolve) => {
+      let resolved = false;
+      let checkTimer: NodeJS.Timeout | undefined;
+
+      const cleanup = () => {
+        resolved = true;
+        clearTimeout(timeoutTimer);
+        if (checkTimer) clearInterval(checkTimer);
+        const set = this.updateListeners.get(id);
+        if (set) {
+          set.delete(onUpdate);
+          if (set.size === 0) this.updateListeners.delete(id);
+        }
+      };
+
+      const onUpdate = (snapshot: DelegationSnapshot) => {
+        if (resolved) return;
+        if (!isActive(snapshot.state) || (snapshot.status_revision ?? 0) > afterRevision) {
+          cleanup();
+          setImmediate(async () => {
+            const job = this.active.get(id);
+            if (job?.runPromise && !isActive(snapshot.state)) {
+              try {
+                await job.runPromise;
+              } catch {
+                // Ignore
+              }
+            }
+            resolve({
+              changed: true,
+              timed_out: false,
+              snapshot: job?.snapshot ?? snapshot,
+            });
+          });
+        }
+      };
+
+      let set = this.updateListeners.get(id);
+      if (!set) {
+        set = new Set();
+        this.updateListeners.set(id, set);
+      }
+      set.add(onUpdate);
+
+      checkTimer = setInterval(async () => {
+        if (resolved) return;
+        try {
+          const snapshot = await this.loadSnapshot(id);
+          if (!isActive(snapshot.state) || (snapshot.status_revision ?? 0) > afterRevision) {
+            onUpdate(snapshot);
+          }
+        } catch {
+          // Ignore polling errors
+        }
+      }, Math.min(200, Math.max(25, timeoutMs)));
+
+      const timeoutTimer = setTimeout(async () => {
+        if (resolved) return;
+        cleanup();
+        try {
+          const snapshot = await this.loadSnapshot(id);
+          if (!isActive(snapshot.state) || (snapshot.status_revision ?? 0) > afterRevision) {
+            const job = this.active.get(id);
+            if (job?.runPromise && !isActive(snapshot.state)) {
+              try {
+                await job.runPromise;
+              } catch {
+                // Ignore
+              }
+            }
+            resolve({
+              changed: true,
+              timed_out: false,
+              snapshot: job?.snapshot ?? snapshot,
+            });
+            return;
+          }
+          resolve({
+            changed: false,
+            timed_out: true,
+            worker_id: id,
+            status_revision: snapshot.status_revision ?? 0,
+            state: snapshot.state,
+          });
+        } catch {
+          resolve({
+            changed: false,
+            timed_out: true,
+            worker_id: id,
+            status_revision: initialSnapshot.status_revision ?? 0,
+            state: initialSnapshot.state,
+          });
+        }
+      }, timeoutMs);
+    });
   }
 
   async getResult(id: string): Promise<DelegationSnapshot> {
     const snapshot = await this.loadSnapshot(id);
     if (isActive(snapshot.state)) {
       throw new Error(`Delegation ${id} is still ${snapshot.state}`);
+    }
+    const job = this.active.get(id);
+    if (job?.runPromise) {
+      try {
+        await job.runPromise;
+      } catch {
+        // Ignore
+      }
     }
     return snapshot;
   }
@@ -1041,14 +1203,11 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       }
     }
 
-    const rawDiff = await getWorktreeDiff(job.task.worktree_path, job.task.base_sha, selectedPath);
-    const cursor = options.cursor ?? 0;
-    const maxBytes = Math.min(options.maxBytes ?? 48 * 1024, this.config.delegation.maxDiffBytes);
-    const maxLines = Math.min(options.maxLines ?? 300, this.config.delegation.maxDiffLines);
-    const page = pageText(rawDiff, cursor, maxBytes, maxLines);
-    const fullDiff = selectedPath
-      ? await getWorktreeDiff(job.task.worktree_path, job.task.base_sha)
-      : rawDiff;
+    const shouldIncludeDiff = options.includeDiff === true
+      || options.path !== undefined
+      || options.cursor !== undefined;
+
+    const fullDiff = await getWorktreeDiff(job.task.worktree_path, job.task.base_sha);
     const outOfScope = findOutOfScopeFiles(changedFiles, job.task.allowed_paths);
     const diffStat = summarizeDiff(fullDiff, changedFiles);
     const budgetGate = evaluateBudget(job.task.budgets, changedFiles, fullDiff);
@@ -1075,8 +1234,32 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     if (validationPassed === false) warnings.push("One or more configured validation checks did not pass.");
     if (residualRisks.length > 0) warnings.push("The worker reported residual risks that require reviewer attention.");
     if (diffStat.binary_files.length > 0) warnings.push("Binary changes require separate inspection.");
-    if (page.nextCursor !== undefined) warnings.push("The selected diff is paginated; fetch the next cursor before approval.");
-    if (page.truncatedLine) warnings.push("One diff line exceeded the byte limit and was truncated.");
+
+    let diffPage: ReviewPacket["diff_page"];
+    if (shouldIncludeDiff) {
+      const rawDiff = selectedPath
+        ? await getWorktreeDiff(job.task.worktree_path, job.task.base_sha, selectedPath)
+        : fullDiff;
+      const cursor = options.cursor ?? 0;
+      const maxBytes = Math.min(options.maxBytes ?? 48 * 1024, this.config.delegation.maxDiffBytes);
+      const maxLines = Math.min(options.maxLines ?? 300, this.config.delegation.maxDiffLines);
+      const page = pageText(rawDiff, cursor, maxBytes, maxLines);
+      if (page.nextCursor !== undefined) warnings.push("The selected diff is paginated; fetch the next cursor before approval.");
+      if (page.truncatedLine) warnings.push("One diff line exceeded the byte limit and was truncated.");
+      diffPage = {
+        ...(selectedPath ? { path: selectedPath } : {}),
+        cursor: page.cursor,
+        ...(page.nextCursor !== undefined ? { next_cursor: page.nextCursor } : {}),
+        returned_lines: page.returnedLines,
+        total_lines: page.totalLines,
+        total_bytes: page.totalBytes,
+        truncated: page.nextCursor !== undefined,
+        truncated_line: page.truncatedLine,
+        text: page.text,
+      };
+    } else {
+      warnings.push("Diff text omitted by default; request with include_diff: true or pass path/cursor to fetch diff pages.");
+    }
 
     const reviewReady = job.snapshot.state === "COMPLETED"
       && changedFiles.length > 0
@@ -1126,17 +1309,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
         : {}),
       residual_risks: residualRisks,
       warnings,
-      diff_page: {
-        ...(selectedPath ? { path: selectedPath } : {}),
-        cursor: page.cursor,
-        ...(page.nextCursor !== undefined ? { next_cursor: page.nextCursor } : {}),
-        returned_lines: page.returnedLines,
-        total_lines: page.totalLines,
-        total_bytes: page.totalBytes,
-        truncated: page.nextCursor !== undefined,
-        truncated_line: page.truncatedLine,
-        text: page.text,
-      },
+      ...(diffPage ? { diff_page: diffPage } : {}),
     };
   }
 
@@ -1382,6 +1555,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
         feedback,
         conversationId,
         signal,
+        job.snapshot.worker_attempts,
       );
       if (job.cancelRequested || signal.aborted) {
         return;
@@ -1593,16 +1767,28 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
 
   private async update(
     job: ActiveDelegation,
-    patch: Partial<DelegationSnapshot>,
+    patch: Omit<Partial<DelegationSnapshot>, "status_revision">,
   ): Promise<void> {
     const operation = job.updateQueue.then(async () => {
+      const nextRevision = (job.snapshot.status_revision ?? 0) + 1;
       const nextSnapshot = DelegationSnapshotSchema.parse({
         ...job.snapshot,
         ...patch,
+        status_revision: nextRevision,
         updated_at: new Date().toISOString(),
       });
       await this.persist(job, nextSnapshot);
       job.snapshot = nextSnapshot;
+      const listeners = this.updateListeners.get(job.task.id);
+      if (listeners) {
+        for (const listener of listeners) {
+          try {
+            listener(nextSnapshot);
+          } catch {
+            // Ignore listener errors
+          }
+        }
+      }
     });
     job.updateQueue = operation.catch(() => undefined);
     await operation;

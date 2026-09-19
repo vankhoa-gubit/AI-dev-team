@@ -11,6 +11,18 @@ import {
   InteractiveDelegationService,
   type InteractiveDelegationApi,
 } from "./interactive-delegation.js";
+import {
+  createSseServer,
+  startSseServer,
+  type SseServerInstance,
+  type SseServerOptions,
+} from "./sse-server.js";
+export {
+  createSseServer,
+  startSseServer,
+  type SseServerInstance,
+  type SseServerOptions,
+};
 
 const harnessRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WorkerIdSchema = z.string().regex(/^delegation-[A-Za-z0-9-]+$/);
@@ -20,7 +32,7 @@ export const SERVER_INSTRUCTIONS = [
   "Codex in the current conversation is the only planner and reviewer; never create an autonomous Codex planner or reviewer.",
   "Delegate only bounded implementation work with explicit allowed paths, acceptance criteria, and validation checks.",
   "Call preview_delegation before delegate_to_antigravity, present blockers and manual-review criteria to the user, and pass preview_contract_hash when delegating the unchanged contract.",
-  "Use wait_for_worker instead of repeatedly polling status; after it returns a terminal state, review get_worker_review_packet and fetch every diff page before requesting a revision or preparing a cherry-pick.",
+  "Use wait_for_worker with after_revision instead of repeatedly polling full status; after it advances or reaches a terminal state, inspect get_worker_review_packet metadata first before requesting diff pages with include_diff or specific paths. UI consumers should stream logs directly from the localhost-only SSE endpoint.",
   "If a worker is INTERRUPTED by an MCP restart, use resume_worker; do not spend a revision round to recover it.",
   "The server never merges into or removes the user's target checkout or worktrees automatically.",
 ].join(" ");
@@ -139,21 +151,23 @@ export function createInteractiveMcpServer(service: InteractiveDelegationApi): M
     "get_worker_review_packet",
     {
       title: "Get Worker Review Packet",
-      description: "Return a deterministic, quota-efficient review packet with task context, scope and validation gates, diff statistics, warnings, residual risks, and a cursor-paginated diff. Acceptance criteria always require Codex review.",
+      description: "Return a metadata-first review packet with task context, scope and validation gates, diff statistics, warnings, and residual risks. Diff text is omitted by default for quota efficiency; pass include_diff: true or path/cursor to fetch paginated diff pages.",
       inputSchema: z.object({
         worker_id: WorkerIdSchema,
+        include_diff: z.boolean().default(false),
         path: z.string().min(1).optional(),
-        cursor: z.number().int().min(0).default(0),
+        cursor: z.number().int().min(0).optional(),
         max_bytes: z.number().int().min(1_024).max(262_144).default(49_152),
         max_lines: z.number().int().min(20).max(2_000).default(300),
       }).strict(),
       annotations: { readOnlyHint: true },
     },
-    async ({ worker_id, path: reviewPath, cursor, max_bytes, max_lines }) => {
+    async ({ worker_id, include_diff, path: reviewPath, cursor, max_bytes, max_lines }) => {
       try {
         return toolResult(await service.getReviewPacket(worker_id, {
+          ...(include_diff ? { includeDiff: true } : {}),
           ...(reviewPath ? { path: reviewPath } : {}),
-          cursor,
+          ...(cursor !== undefined ? { cursor } : {}),
           maxBytes: max_bytes,
           maxLines: max_lines,
         }));
@@ -201,16 +215,17 @@ export function createInteractiveMcpServer(service: InteractiveDelegationApi): M
     "wait_for_worker",
     {
       title: "Wait for worker",
-      description: "Wait until a delegated worker reaches a non-active state or the timeout expires, avoiding repeated status polling.",
+      description: "Wait until a delegated worker reaches a non-active state, advances status_revision past after_revision, or times out. Pass after_revision to avoid repeated full snapshots; if unchanged on timeout, returns a compact response.",
       inputSchema: z.object({
         worker_id: WorkerIdSchema,
         timeout_seconds: z.number().int().min(1).max(840).default(840),
+        after_revision: z.number().int().min(0).optional(),
       }).strict(),
       annotations: { readOnlyHint: true },
     },
-    async ({ worker_id, timeout_seconds }) => {
+    async ({ worker_id, timeout_seconds, after_revision }) => {
       try {
-        return toolResult(await service.waitForWorker(worker_id, timeout_seconds * 1_000));
+        return toolResult(await service.waitForWorker(worker_id, timeout_seconds * 1_000, after_revision));
       } catch (error) {
         return toolError(error);
       }
@@ -353,6 +368,25 @@ async function main(): Promise<void> {
   const worker = new AntigravityAdapter(config.antigravity, harnessRoot);
   const service = new InteractiveDelegationService(config, harnessRoot, worker);
   await service.initialize();
+
+  const ssePortArg = optionValue(args, "--sse-port");
+  const enableSse = args.includes("--enable-sse") || Boolean(ssePortArg) || process.env.AI_DEV_TEAM_ENABLE_SSE === "true";
+  if (enableSse) {
+    const ssePort = ssePortArg ? parseInt(ssePortArg, 10) : 0;
+    if (!Number.isInteger(ssePort) || ssePort < 0 || ssePort > 65_535) {
+      throw new Error("--sse-port must be an integer between 0 and 65535");
+    }
+    const sseOrigin = optionValue(args, "--sse-origin") ?? process.env.AI_DEV_TEAM_SSE_ORIGIN;
+    const sse = await startSseServer({
+      delegationsRoot: service.getDelegationsRoot(),
+      service,
+      port: ssePort,
+      host: "127.0.0.1",
+      ...(sseOrigin ? { allowedOrigins: [sseOrigin] } : {}),
+    });
+    console.error(`AI Dev Team SSE log endpoint is listening on ${sse.url}`);
+  }
+
   serveStdio(() => createInteractiveMcpServer(service));
   console.error("AI Dev Team Antigravity MCP server is listening on stdio");
 }
