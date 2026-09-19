@@ -22,19 +22,12 @@ function git(cwd, args) {
 }
 
 async function waitForTerminal(service, workerId) {
-  const activeStates = new Set(["PREPARING", "WORKER_RUNNING", "CHECKING"]);
-  const deadline = Date.now() + 25 * 60 * 1000;
-  let previous;
-  while (Date.now() < deadline) {
-    const snapshot = await service.getStatus(workerId);
-    if (snapshot.state !== previous) {
-      console.log(`[smoke] ${snapshot.state}: ${snapshot.message}`);
-      previous = snapshot.state;
-    }
-    if (!activeStates.has(snapshot.state)) return snapshot;
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  const result = await service.waitForWorker(workerId, 25 * 60 * 1000);
+  if (result.timed_out) {
+    throw new Error(`Worker ${workerId} did not finish within 25 minutes`);
   }
-  throw new Error(`Worker ${workerId} did not finish within 25 minutes`);
+  console.log(`[smoke] ${result.snapshot.state}: ${result.snapshot.message}`);
+  return result.snapshot;
 }
 
 try {

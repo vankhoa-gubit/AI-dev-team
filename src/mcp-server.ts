@@ -19,7 +19,7 @@ export const SERVER_INSTRUCTIONS = [
   "Do not delegate implementation until the user has explicitly approved the plan in the current conversation.",
   "Codex in the current conversation is the only planner and reviewer; never create an autonomous Codex planner or reviewer.",
   "Delegate only bounded implementation work with explicit allowed paths, acceptance criteria, and validation checks.",
-  "Poll get_worker_status until the worker is no longer active, then review get_worker_diff before requesting a revision or preparing a cherry-pick.",
+  "Use wait_for_worker instead of repeatedly polling status; after it returns a terminal state, review get_worker_diff before requesting a revision or preparing a cherry-pick.",
   "The server never merges into or removes the user's target checkout or worktrees automatically.",
 ].join(" ");
 
@@ -110,6 +110,26 @@ export function createInteractiveMcpServer(service: InteractiveDelegationApi): M
     async ({ worker_id }) => {
       try {
         return toolResult(await service.getStatus(worker_id));
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "wait_for_worker",
+    {
+      title: "Wait for worker",
+      description: "Wait until a delegated worker reaches a non-active state or the timeout expires, avoiding repeated status polling.",
+      inputSchema: z.object({
+        worker_id: WorkerIdSchema,
+        timeout_seconds: z.number().int().min(1).max(840).default(840),
+      }).strict(),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ worker_id, timeout_seconds }) => {
+      try {
+        return toolResult(await service.waitForWorker(worker_id, timeout_seconds * 1_000));
       } catch (error) {
         return toolError(error);
       }

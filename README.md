@@ -10,9 +10,10 @@ The harness does not invoke Codex CLI, use a model gateway, plan autonomously, r
 2. Codex calls `delegate_to_antigravity` with an objective, allowed paths, acceptance criteria, and validation commands.
 3. The harness creates an isolated branch and Git worktree.
 4. Antigravity implements the task.
-5. The harness rejects denied actions, empty changes, out-of-scope files, and failed checks.
-6. Codex reads the bounded diff and either requests a revision or prepares a cherry-pick handoff.
-7. You explicitly decide whether to run the returned cherry-pick command.
+5. Codex uses a bounded `wait_for_worker` call instead of repeatedly polling status.
+6. The harness rejects denied actions, empty changes, out-of-scope files, and failed checks.
+7. Codex reads the bounded diff and either requests a revision or prepares a cherry-pick handoff.
+8. You explicitly decide whether to run the returned cherry-pick command.
 
 Multiple workers may run concurrently only when their scopes are provably disjoint. The harness never auto-merges and never removes worktrees.
 
@@ -58,6 +59,7 @@ handoff mutations.
 - `delegate_to_antigravity`: create a bounded asynchronous worker in an isolated worktree.
 - `list_workers`: list persisted delegations, optionally filtered by repository.
 - `get_worker_status`: read current state and quota-oriented attempt metrics.
+- `wait_for_worker`: wait for a terminal state or bounded timeout without repeated Codex polling.
 - `get_worker_result`: read the terminal worker result and validation evidence.
 - `get_worker_diff`: return a size-bounded Git diff, including untracked files.
 - `request_worker_revision`: resume the same Antigravity conversation with review feedback.

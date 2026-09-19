@@ -247,6 +247,55 @@ test("active workers enforce concurrency and non-overlapping scopes", async () =
   }
 });
 
+test("worker waiting returns terminal state and reports bounded timeout", async () => {
+  const fixture = await createRepository("harness-wait-");
+  const worker: Worker = {
+    async run(task: TaskSpec, _directory, _feedback, _conversation, signal) {
+      if (task.objective === "Slow task") {
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        await mkdir(path.join(task.worktree_path, "src"), { recursive: true });
+        await writeFile(path.join(task.worktree_path, "src", "result.txt"), "done\n", "utf8");
+      }
+      return {
+        result: {
+          status: "success", summary: "done", files_changed: ["src/result.txt"], checks_attempted: [], residual_risks: [],
+        },
+        process: processResult(task.worktree_path),
+      };
+    },
+  };
+  try {
+    const service = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const request = {
+      repository_path: fixture.repoPath,
+      objective: "Fast task",
+      allowed_paths: ["src/fast/**", "src/result.txt"],
+      acceptance_criteria: ["done"],
+      checks: [],
+    };
+    const fast = await service.delegate(request);
+    const completed = await service.waitForWorker(fast.id, 2_000);
+    assert.equal(completed.timed_out, false);
+    assert.equal(completed.snapshot.state, "COMPLETED");
+
+    const slow = await service.delegate({
+      ...request,
+      objective: "Slow task",
+      allowed_paths: ["src/slow/**"],
+    });
+    const timedOut = await service.waitForWorker(slow.id, 20);
+    assert.equal(timedOut.timed_out, true);
+    assert.equal(timedOut.snapshot.state, "WORKER_RUNNING");
+    await service.cancel(slow.id);
+  } finally {
+    await rm(fixture.tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("server restart preserves an active worktree and exposes an explicit resume state", async () => {
   const fixture = await createRepository("harness-restart-");
   const worker: Worker = {
@@ -290,6 +339,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
     list: unavailable,
     delegate: unavailable,
     getStatus: unavailable,
+    waitForWorker: unavailable,
     getResult: unavailable,
     getDiff: unavailable,
     prepareCherryPick: unavailable,
@@ -311,6 +361,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
       "list_workers",
       "prepare_worker_cherry_pick",
       "request_worker_revision",
+      "wait_for_worker",
     ]);
   } finally {
     await client.close();

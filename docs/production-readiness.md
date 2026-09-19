@@ -1,6 +1,6 @@
 # MCP production-readiness evidence
 
-Date: 2026-09-18 (Asia/Bangkok)
+Date: 2026-09-18; incremental validation updated 2026-09-19 (Asia/Bangkok)
 
 ## Runtime
 
@@ -17,10 +17,10 @@ Date: 2026-09-18 (Asia/Bangkok)
 `npm run check` passed:
 
 - strict TypeScript typecheck
-- 7 MCP-focused tests
+- 8 MCP-focused tests
 - production build
 
-The STDIO handshake returned all eight expected tools:
+The STDIO handshake returned all nine expected tools:
 
 - `cancel_worker`
 - `delegate_to_antigravity`
@@ -30,6 +30,13 @@ The STDIO handshake returned all eight expected tools:
 - `list_workers`
 - `prepare_worker_cherry_pick`
 - `request_worker_revision`
+- `wait_for_worker`
+
+The 2026-09-19 incremental validation added completion and bounded-timeout
+coverage for `wait_for_worker`. A fresh STDIO `listTools` handshake against the
+production build returned all nine tools. The real-provider smoke test below was
+not repeated for this read-only waiting change, avoiding an unnecessary
+Antigravity invocation.
 
 ## Real Antigravity smoke test
 
@@ -58,9 +65,9 @@ Passing run evidence:
 [smoke] PASS worker=delegation-20260918154602-9f823ad6 commit=fd9cb2f1b32a37748f552a251b1343e58facde4f
 ```
 
-## Remaining local cleanup
+## Local legacy tombstones
 
-Legacy source/UI files have inert tombstone contents and are excluded from the
-runtime, build, and tests. The running Codex desktop process still holds Windows
-delete handles for those original paths. Restart Codex, then remove the
-tombstone files physically before creating the MCP-first baseline commit.
+Legacy source/UI paths are no longer tracked by Git and are excluded from the
+runtime, build, and tests. Inert ignored copies may remain on this Windows host
+when the desktop process holds delete handles; they are not part of a commit or
+new checkout.

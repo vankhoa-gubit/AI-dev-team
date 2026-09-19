@@ -101,6 +101,11 @@ export interface CherryPickHandoff {
   command: string;
 }
 
+export interface WaitWorkerResult {
+  timed_out: boolean;
+  snapshot: DelegationSnapshot;
+}
+
 interface ActiveDelegation {
   task: TaskSpec;
   jobDirectory: string;
@@ -114,6 +119,7 @@ export interface InteractiveDelegationApi {
   list(repositoryPath?: string): Promise<DelegationSnapshot[]>;
   delegate(request: DelegationRequest): Promise<DelegationSnapshot>;
   getStatus(id: string): Promise<DelegationSnapshot>;
+  waitForWorker(id: string, timeoutMs: number): Promise<WaitWorkerResult>;
   getResult(id: string): Promise<DelegationSnapshot>;
   getDiff(id: string): Promise<DelegationDiff>;
   prepareCherryPick(id: string): Promise<CherryPickHandoff>;
@@ -300,6 +306,24 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
 
   async getStatus(id: string): Promise<DelegationSnapshot> {
     return await this.loadSnapshot(id);
+  }
+
+  async waitForWorker(id: string, timeoutMs: number): Promise<WaitWorkerResult> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+      throw new Error("Worker wait timeout must be a non-negative finite number");
+    }
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const snapshot = await this.loadSnapshot(id);
+      if (!isActive(snapshot.state)) {
+        return { timed_out: false, snapshot };
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        return { timed_out: true, snapshot };
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, remainingMs)));
+    }
   }
 
   async getResult(id: string): Promise<DelegationSnapshot> {
