@@ -34,6 +34,20 @@ node .\dist\cli.js doctor
 
 The doctor checks only Antigravity CLI and Git. Codex authentication and model selection belong to the Codex app/session, not this harness.
 
+Run the opt-in end-to-end Deep Doctor before the first real delegation or after
+changing Antigravity authentication, model, permissions, or CLI version:
+
+```powershell
+node .\dist\cli.js doctor --deep
+```
+
+Deep Doctor consumes one real Antigravity invocation. It creates a disposable
+Git repository, exercises isolated worktree creation, file read/write,
+allowlisted validation, structured output, conversation capture, handoff, and
+worktree cleanup. The disposable repository is removed afterward. A report and
+raw provider stdout/stderr are retained under `.harness/doctor/<run-id>` so an
+empty response or soft-denied action can be diagnosed without blindly retrying.
+
 ## Register the MCP server
 
 Build the project, then register this local stdio server in Codex:

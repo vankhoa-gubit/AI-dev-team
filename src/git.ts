@@ -4,6 +4,8 @@ import { assertProcessSucceeded, runProcess } from "./process.js";
 import type { ProcessResult } from "./types.js";
 
 const GIT_TIMEOUT_MS = 60_000;
+const WORKTREE_REMOVE_ATTEMPTS = process.platform === "win32" ? 6 : 1;
+const WORKTREE_REMOVE_RETRY_MS = 250;
 
 async function git(repoPath: string, args: string[]) {
   return await runProcess("git", args, { cwd: repoPath, timeoutMs: GIT_TIMEOUT_MS });
@@ -65,8 +67,21 @@ export async function removeWorktree(repoPath: string, worktreePath: string): Pr
     throw new Error(`Worker worktree is not registered with Git: ${resolvedWorktree}`);
   }
 
-  const result = await git(resolvedRepository, ["worktree", "remove", resolvedWorktree]);
-  assertProcessSucceeded(result, "git worktree remove");
+  let lastResult: ProcessResult | undefined;
+  for (let attempt = 1; attempt <= WORKTREE_REMOVE_ATTEMPTS; attempt += 1) {
+    lastResult = await git(resolvedRepository, ["worktree", "remove", resolvedWorktree]);
+    if (!lastResult.timedOut && lastResult.exitCode === 0) return;
+
+    const details = `${lastResult.stderr}\n${lastResult.stdout}`.toLowerCase();
+    const retryableWindowsLock = process.platform === "win32" && (
+      details.includes("permission denied")
+      || details.includes("being used by another process")
+      || details.includes("access is denied")
+    );
+    if (!retryableWindowsLock || attempt === WORKTREE_REMOVE_ATTEMPTS) break;
+    await new Promise((resolve) => setTimeout(resolve, WORKTREE_REMOVE_RETRY_MS));
+  }
+  assertProcessSucceeded(lastResult as ProcessResult, "git worktree remove");
 }
 
 export async function gitBranchExists(repoPath: string, branch: string): Promise<boolean> {

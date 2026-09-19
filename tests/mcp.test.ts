@@ -8,6 +8,7 @@ import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
 import { parseAntigravityOutput, type Worker } from "../src/adapters/antigravity.js";
 import { HarnessConfigSchema, type HarnessConfig } from "../src/config.js";
+import { classifyDoctorFailure, runDeepDoctor } from "../src/doctor.js";
 import { findOutOfScopeFiles } from "../src/git.js";
 import {
   InteractiveDelegationService,
@@ -127,6 +128,62 @@ test("configuration rejects removed Codex provider and router settings", () => {
     ...testConfig(),
     codex: { command: "codex" },
   }));
+});
+
+test("deep doctor exercises the worker and removes its disposable fixture", async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "harness-deep-doctor-test-"));
+  const artifacts = path.join(tempRoot, "artifacts");
+  const fixtures = path.join(tempRoot, "fixtures");
+  let receivedTask: TaskSpec | undefined;
+  const worker: Worker = {
+    async run(task): Promise<WorkerRunResult> {
+      receivedTask = task;
+      await mkdir(path.join(task.worktree_path, "doctor"), { recursive: true });
+      await writeFile(
+        path.join(task.worktree_path, "doctor", "antigravity.txt"),
+        "antigravity deep doctor ok\n",
+        "utf8",
+      );
+      return {
+        result: {
+          status: "success",
+          summary: "deep doctor fixture completed",
+          files_changed: ["doctor/antigravity.txt"],
+          checks_attempted: [],
+          residual_risks: [],
+          conversation_id: "doctor-conversation",
+        },
+        process: processResult(task.worktree_path),
+      };
+    },
+  };
+
+  try {
+    const config = testConfig();
+    config.validation.allowedExecutables = ["node", "node.exe"];
+    const report = await runDeepDoctor(config, tempRoot, {
+      worker,
+      artifactRoot: artifacts,
+      temporaryParent: fixtures,
+    });
+    assert.equal(report.ok, true, report.error);
+    assert.equal(report.fixture_removed, true);
+    assert.equal(report.conversation_id, "doctor-conversation");
+    assert.equal(receivedTask?.allowed_paths[0], "doctor/**");
+    assert.equal(await readFile(path.join(artifacts, "report.json"), "utf8").then(Boolean), true);
+    assert.equal((await readdir(fixtures)).length, 0);
+    assert.ok(report.artifact_manifest.some((entry) => entry.endsWith("status.json")));
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("deep doctor classifies actionable provider failures", () => {
+  assert.equal(classifyDoctorFailure(new Error("Antigravity denied required actions")), "permission_denied");
+  assert.equal(classifyDoctorFailure(new Error("Antigravity reported success but returned empty structured output")), "empty_output");
+  assert.equal(classifyDoctorFailure(new Error("Antigravity worker timed out after 1000ms")), "timeout");
+  assert.equal(classifyDoctorFailure(new Error("model unavailable for this account")), "auth_or_model_unavailable");
+  assert.equal(classifyDoctorFailure(new Error("git worktree remove: Permission denied")), "cleanup_failure");
 });
 
 test("chat delegation supports revision, bounded diff, persistence, and safe cherry-pick handoff", async () => {
