@@ -62,11 +62,12 @@ handoff mutations.
 - `wait_for_worker`: wait for a terminal state or bounded timeout without repeated Codex polling.
 - `get_worker_result`: read the terminal worker result and validation evidence.
 - `get_worker_diff`: return a size-bounded Git diff, including untracked files.
+- `resume_worker`: resume an interrupted worker without consuming a revision round.
 - `request_worker_revision`: resume the same Antigravity conversation with review feedback.
 - `prepare_worker_cherry_pick`: re-run safety gates, commit the isolated branch, and return a command without changing the target checkout.
 - `cancel_worker`: stop an active worker while preserving its artifacts.
 
-Delegation artifacts live under `.harness/delegations/<worker-id>`. If the MCP server restarts during execution, the persisted delegation becomes `WAITING_FOR_REVISION` when its worktree is available, so Codex can explicitly resume it.
+Delegation artifacts live under `.harness/delegations/<worker-id>`. If the MCP server restarts during execution, the persisted delegation becomes `INTERRUPTED` when its worktree is available. Codex can call `resume_worker` without consuming the review revision budget.
 
 ## Task contract
 

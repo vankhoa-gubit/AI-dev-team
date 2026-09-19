@@ -41,6 +41,7 @@ export const DelegationStateSchema = z.enum([
   "PREPARING",
   "WORKER_RUNNING",
   "CHECKING",
+  "INTERRUPTED",
   "WAITING_FOR_REVISION",
   "COMPLETED",
   "FAILED",
@@ -123,6 +124,7 @@ export interface InteractiveDelegationApi {
   getResult(id: string): Promise<DelegationSnapshot>;
   getDiff(id: string): Promise<DelegationDiff>;
   prepareCherryPick(id: string): Promise<CherryPickHandoff>;
+  resumeWorker(id: string): Promise<DelegationSnapshot>;
   requestRevision(id: string, feedback: string): Promise<DelegationSnapshot>;
   cancel(id: string): Promise<DelegationSnapshot>;
 }
@@ -188,8 +190,8 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
         const worktreeAvailable = await pathExists(job.task.worktree_path);
         await this.update(job, worktreeAvailable
           ? {
-              state: "WAITING_FOR_REVISION",
-              message: "MCP server restarted during execution; worktree was preserved. Request a revision to resume the worker.",
+              state: "INTERRUPTED",
+              message: "MCP server restarted during execution; worktree was preserved. Resume the worker without consuming a revision.",
               revision_feedback: "Resume after MCP server restart and complete the task.",
             }
           : {
@@ -397,6 +399,32 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       argv,
       command: formatCommand(argv),
     };
+  }
+
+  async resumeWorker(id: string): Promise<DelegationSnapshot> {
+    const job = await this.loadActiveJob(id);
+    if (job.snapshot.state !== "INTERRUPTED") {
+      throw new Error(`Delegation ${id} cannot be resumed from state ${job.snapshot.state}`);
+    }
+    if (job.snapshot.commit_sha) {
+      throw new Error(`Delegation ${id} is already committed for handoff`);
+    }
+    if (!await pathExists(job.task.worktree_path)) {
+      throw new Error(`Delegation ${id} cannot be resumed because its worktree is unavailable`);
+    }
+
+    const resumeFeedback = job.snapshot.revision_feedback
+      ?? "Resume after MCP server restart and complete the task.";
+    job.cancelRequested = false;
+    await this.update(job, {
+      state: "WORKER_RUNNING",
+      worker_attempts: job.snapshot.worker_attempts + 1,
+      message: "Antigravity worker is resuming after MCP server restart",
+      revision_feedback: resumeFeedback,
+      checks: [],
+    });
+    this.startWorker(job, resumeFeedback);
+    return job.snapshot;
   }
 
   async requestRevision(id: string, feedback: string): Promise<DelegationSnapshot> {

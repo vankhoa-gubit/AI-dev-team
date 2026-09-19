@@ -20,6 +20,7 @@ export const SERVER_INSTRUCTIONS = [
   "Codex in the current conversation is the only planner and reviewer; never create an autonomous Codex planner or reviewer.",
   "Delegate only bounded implementation work with explicit allowed paths, acceptance criteria, and validation checks.",
   "Use wait_for_worker instead of repeatedly polling status; after it returns a terminal state, review get_worker_diff before requesting a revision or preparing a cherry-pick.",
+  "If a worker is INTERRUPTED by an MCP restart, use resume_worker; do not spend a revision round to recover it.",
   "The server never merges into or removes the user's target checkout or worktrees automatically.",
 ].join(" ");
 
@@ -182,6 +183,22 @@ export function createInteractiveMcpServer(service: InteractiveDelegationApi): M
     async ({ worker_id, feedback }) => {
       try {
         return toolResult(await service.requestRevision(worker_id, feedback));
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "resume_worker",
+    {
+      title: "Resume interrupted worker",
+      description: "Resume an INTERRUPTED Antigravity worker in its preserved worktree without consuming a revision round.",
+      inputSchema: z.object({ worker_id: WorkerIdSchema }).strict(),
+    },
+    async ({ worker_id }) => {
+      try {
+        return toolResult(await service.resumeWorker(worker_id));
       } catch (error) {
         return toolError(error);
       }

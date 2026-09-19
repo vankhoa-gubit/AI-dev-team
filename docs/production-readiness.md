@@ -20,7 +20,7 @@ Date: 2026-09-18; incremental validation updated 2026-09-19 (Asia/Bangkok)
 - 8 MCP-focused tests
 - production build
 
-The STDIO handshake returned all nine expected tools:
+The STDIO handshake returned all ten expected tools:
 
 - `cancel_worker`
 - `delegate_to_antigravity`
@@ -30,12 +30,15 @@ The STDIO handshake returned all nine expected tools:
 - `list_workers`
 - `prepare_worker_cherry_pick`
 - `request_worker_revision`
+- `resume_worker`
 - `wait_for_worker`
 
 The 2026-09-19 incremental validation added completion and bounded-timeout
-coverage for `wait_for_worker`. A fresh STDIO `listTools` handshake against the
-production build returned all nine tools. The real-provider smoke test below was
-not repeated for this read-only waiting change, avoiding an unnecessary
+coverage for `wait_for_worker`, plus restart recovery coverage proving that
+`resume_worker` preserves the worktree, reuses a persisted conversation ID, and
+does not consume a revision round. A fresh STDIO `listTools` handshake against
+the production build returned all ten tools. The real-provider smoke test below
+was not repeated for these orchestration-only changes, avoiding an unnecessary
 Antigravity invocation.
 
 ## Real Antigravity smoke test

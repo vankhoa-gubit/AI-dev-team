@@ -296,16 +296,28 @@ test("worker waiting returns terminal state and reports bounded timeout", async 
   }
 });
 
-test("server restart preserves an active worktree and exposes an explicit resume state", async () => {
+test("server restart marks a worker interrupted and resumes without spending a revision", async () => {
   const fixture = await createRepository("harness-restart-");
+  let attempts = 0;
+  const conversations: Array<string | undefined> = [];
   const worker: Worker = {
-    async run(task: TaskSpec, _directory, _feedback, _conversation, signal) {
-      await new Promise<void>((resolve) => {
-        signal?.addEventListener("abort", () => resolve(), { once: true });
-      });
+    async run(task: TaskSpec, _directory, feedback, conversationId) {
+      attempts += 1;
+      conversations.push(conversationId);
+      if (attempts === 1) {
+        await new Promise<never>(() => undefined);
+      }
+      assert.match(feedback ?? "", /resume after MCP server restart/i);
+      await mkdir(path.join(task.worktree_path, "src"), { recursive: true });
+      await writeFile(path.join(task.worktree_path, "src", "resumed.txt"), "resumed\n", "utf8");
       return {
         result: {
-          status: "success", summary: "stopped", files_changed: [], checks_attempted: [], residual_risks: [],
+          status: "success",
+          summary: "resumed",
+          files_changed: ["src/resumed.txt"],
+          checks_attempted: [],
+          residual_risks: [],
+          conversation_id: "conversation-before-restart",
         },
         process: processResult(task.worktree_path),
       };
@@ -320,12 +332,41 @@ test("server restart preserves an active worktree and exposes an explicit resume
       acceptance_criteria: ["done"],
       checks: [],
     });
+    const statusPath = path.join(
+      fixture.harnessRoot,
+      ".harness",
+      "delegations",
+      started.id,
+      "status.json",
+    );
+    const persisted = JSON.parse(await readFile(statusPath, "utf8")) as DelegationSnapshot;
+    persisted.worker_result = {
+      status: "success",
+      summary: "conversation allocated before restart",
+      files_changed: [],
+      checks_attempted: [],
+      residual_risks: [],
+      conversation_id: "conversation-before-restart",
+    };
+    await writeFile(statusPath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
+
     const restartedServer = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
     await restartedServer.initialize();
     const recovered = await restartedServer.getStatus(started.id);
-    assert.equal(recovered.state, "WAITING_FOR_REVISION");
+    assert.equal(recovered.state, "INTERRUPTED");
     assert.match(recovered.message, /restarted during execution/);
-    await firstServer.cancel(started.id);
+    assert.equal(recovered.revision_round, 0);
+
+    const resumed = await restartedServer.resumeWorker(started.id);
+    assert.equal(resumed.state, "WORKER_RUNNING");
+    assert.equal(resumed.revision_round, 0);
+    assert.equal(resumed.worker_attempts, 2);
+    const completed = await restartedServer.waitForWorker(started.id, 2_000);
+    assert.equal(completed.timed_out, false);
+    assert.equal(completed.snapshot.state, "COMPLETED");
+    assert.equal(completed.snapshot.revision_round, 0);
+    assert.deepEqual(conversations, [undefined, "conversation-before-restart"]);
+    await assert.rejects(restartedServer.resumeWorker(started.id), /cannot be resumed/);
   } finally {
     await rm(fixture.tempRoot, { recursive: true, force: true });
   }
@@ -343,6 +384,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
     getResult: unavailable,
     getDiff: unavailable,
     prepareCherryPick: unavailable,
+    resumeWorker: unavailable,
     requestRevision: unavailable,
     cancel: unavailable,
   };
@@ -361,6 +403,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
       "list_workers",
       "prepare_worker_cherry_pick",
       "request_worker_revision",
+      "resume_worker",
       "wait_for_worker",
     ]);
   } finally {
