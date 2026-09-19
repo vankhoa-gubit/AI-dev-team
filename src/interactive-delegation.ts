@@ -17,6 +17,7 @@ import {
 import { boundText, formatCommand } from "./output.js";
 import { findOverlappingScope } from "./scope.js";
 import {
+  ClientRequestIdSchema,
   TaskSpecSchema,
   ValidationCommandSchema,
   WorkerResultSchema,
@@ -33,6 +34,7 @@ export const DelegationRequestSchema = z.object({
   acceptance_criteria: z.array(z.string().min(1)).min(1),
   checks: z.array(ValidationCommandSchema).default([]),
   worker_instructions: z.string().min(1).optional(),
+  client_request_id: ClientRequestIdSchema.optional(),
 }).strict();
 
 export type DelegationRequest = z.infer<typeof DelegationRequestSchema>;
@@ -49,6 +51,43 @@ export const DelegationStateSchema = z.enum([
 ]);
 
 export type DelegationState = z.infer<typeof DelegationStateSchema>;
+
+const AttemptTriggerSchema = z.enum(["initial", "revision", "resume"]);
+const AttemptOutcomeSchema = z.enum([
+  "running",
+  "completed",
+  "waiting_for_revision",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
+const FailureCategorySchema = z.enum([
+  "provider_error",
+  "empty_output",
+  "denied_action",
+  "timeout",
+  "scope_violation",
+  "validation_failure",
+]);
+
+const WorkerAttemptSchema = z.object({
+  attempt: z.number().int().min(1),
+  trigger: AttemptTriggerSchema,
+  started_at: z.string(),
+  finished_at: z.string().optional(),
+  duration_ms: z.number().int().min(0).optional(),
+  provider_duration_ms: z.number().int().min(0).optional(),
+  validation_duration_ms: z.number().int().min(0).optional(),
+  outcome: AttemptOutcomeSchema,
+  conversation_reused: z.boolean(),
+  validation_passed: z.boolean().optional(),
+  failure_category: FailureCategorySchema.optional(),
+}).strict();
+
+export type AttemptTrigger = z.infer<typeof AttemptTriggerSchema>;
+export type AttemptOutcome = z.infer<typeof AttemptOutcomeSchema>;
+export type FailureCategory = z.infer<typeof FailureCategorySchema>;
+export type WorkerAttempt = z.infer<typeof WorkerAttemptSchema>;
 
 const CheckEvidenceSchema = z.object({
   command: z.string(),
@@ -81,6 +120,8 @@ export const DelegationSnapshotSchema = z.object({
   worker_result: WorkerResultSchema.optional(),
   revision_feedback: z.string().optional(),
   commit_sha: z.string().min(1).optional(),
+  client_request_id: ClientRequestIdSchema.optional(),
+  attempt_history: z.array(WorkerAttemptSchema).default([]),
 }).strict();
 
 export type DelegationSnapshot = z.infer<typeof DelegationSnapshotSchema>;
@@ -107,6 +148,28 @@ export interface WaitWorkerResult {
   snapshot: DelegationSnapshot;
 }
 
+export type DelegationStartResult = DelegationSnapshot & {
+  delegation_outcome: "created" | "reused";
+};
+
+export interface WorkerMetrics {
+  worker_id: string;
+  state: DelegationState;
+  worker_attempts: number;
+  revision_rounds: number;
+  initial_attempts: number;
+  revision_attempts: number;
+  resume_attempts: number;
+  completed_attempts: number;
+  failed_attempts: number;
+  conversation_reuse_count: number;
+  total_duration_ms: number;
+  total_provider_duration_ms: number;
+  total_validation_duration_ms: number;
+  last_failure_category?: FailureCategory;
+  attempts: WorkerAttempt[];
+}
+
 interface ActiveDelegation {
   task: TaskSpec;
   jobDirectory: string;
@@ -118,8 +181,9 @@ interface ActiveDelegation {
 
 export interface InteractiveDelegationApi {
   list(repositoryPath?: string): Promise<DelegationSnapshot[]>;
-  delegate(request: DelegationRequest): Promise<DelegationSnapshot>;
+  delegate(request: DelegationRequest): Promise<DelegationStartResult>;
   getStatus(id: string): Promise<DelegationSnapshot>;
+  getMetrics(id: string): Promise<WorkerMetrics>;
   waitForWorker(id: string, timeoutMs: number): Promise<WaitWorkerResult>;
   getResult(id: string): Promise<DelegationSnapshot>;
   getDiff(id: string): Promise<DelegationDiff>;
@@ -151,6 +215,14 @@ function isActive(state: DelegationState): boolean {
   return state === "PREPARING" || state === "WORKER_RUNNING" || state === "CHECKING";
 }
 
+function classifyFailure(error: unknown): FailureCategory {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  if (message.includes("denied required actions")) return "denied_action";
+  if (message.includes("empty output") || message.includes("empty structured output")) return "empty_output";
+  if (message.includes("timed out")) return "timeout";
+  return "provider_error";
+}
+
 function assertDelegationId(id: string): void {
   if (!/^delegation-[A-Za-z0-9-]+$/.test(id)) {
     throw new Error("Invalid delegation id");
@@ -168,6 +240,7 @@ async function pathExists(candidate: string): Promise<boolean> {
 
 export class InteractiveDelegationService implements InteractiveDelegationApi {
   private readonly active = new Map<string, ActiveDelegation>();
+  private readonly pendingDelegations = new Map<string, Promise<DelegationStartResult>>();
   private readonly delegationsRoot: string;
 
   constructor(
@@ -193,10 +266,12 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
               state: "INTERRUPTED",
               message: "MCP server restarted during execution; worktree was preserved. Resume the worker without consuming a revision.",
               revision_feedback: "Resume after MCP server restart and complete the task.",
+              attempt_history: this.finishAttemptHistory(job, "interrupted"),
             }
           : {
               state: "FAILED",
               message: "MCP server restarted before the isolated worktree was available.",
+              attempt_history: this.finishAttemptHistory(job, "failed", "provider_error"),
             });
       } catch {
         // A corrupt delegation remains on disk for manual diagnosis and does not block the server.
@@ -223,9 +298,95 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     return snapshots.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
   }
 
-  async delegate(input: DelegationRequest): Promise<DelegationSnapshot> {
+  async delegate(input: DelegationRequest): Promise<DelegationStartResult> {
     const request = DelegationRequestSchema.parse(input);
     const repositoryPath = path.resolve(request.repository_path);
+    if (!request.client_request_id) {
+      return await this.createDelegation(request, repositoryPath);
+    }
+
+    const repositoryKey = process.platform === "win32"
+      ? repositoryPath.toLowerCase()
+      : repositoryPath;
+    const pendingKey = `${repositoryKey}\0${request.client_request_id}`;
+    const pending = this.pendingDelegations.get(pendingKey);
+    if (pending) {
+      await pending;
+      return await this.delegateIdempotently(request, repositoryPath);
+    }
+
+    const operation = this.delegateIdempotently(request, repositoryPath);
+    this.pendingDelegations.set(pendingKey, operation);
+    try {
+      return await operation;
+    } finally {
+      this.pendingDelegations.delete(pendingKey);
+    }
+  }
+
+  private async delegateIdempotently(
+    request: DelegationRequest,
+    repositoryPath: string,
+  ): Promise<DelegationStartResult> {
+    const existing = await this.findByClientRequestId(repositoryPath, request.client_request_id!);
+    if (existing) {
+      const expectedContract = JSON.stringify({
+        objective: request.objective,
+        allowed_paths: request.allowed_paths,
+        acceptance_criteria: request.acceptance_criteria,
+        checks: request.checks,
+        worker_instructions: request.worker_instructions ?? request.objective,
+      });
+      const existingContract = JSON.stringify({
+        objective: existing.task.objective,
+        allowed_paths: existing.task.allowed_paths,
+        acceptance_criteria: existing.task.acceptance_criteria,
+        checks: existing.task.checks,
+        worker_instructions: existing.task.worker_instructions,
+      });
+      if (expectedContract !== existingContract) {
+        throw new Error(
+          `client_request_id ${request.client_request_id} is already used by ${existing.task.id} with a different task contract`,
+        );
+      }
+      return { ...existing.snapshot, delegation_outcome: "reused" };
+    }
+    return await this.createDelegation(request, repositoryPath);
+  }
+
+  private async findByClientRequestId(
+    repositoryPath: string,
+    clientRequestId: string,
+  ): Promise<ActiveDelegation | undefined> {
+    await mkdir(this.delegationsRoot, { recursive: true });
+    const entries = await readdir(this.delegationsRoot, { withFileTypes: true });
+    const matches: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^delegation-[A-Za-z0-9-]+$/.test(entry.name)) continue;
+      try {
+        const snapshot = await this.loadSnapshot(entry.name);
+        const sameRepository = process.platform === "win32"
+          ? snapshot.repository_path.toLowerCase() === repositoryPath.toLowerCase()
+          : snapshot.repository_path === repositoryPath;
+        if (sameRepository && snapshot.client_request_id === clientRequestId) {
+          matches.push(entry.name);
+        }
+      } catch {
+        // Corrupt entries are preserved for diagnosis and cannot satisfy an idempotency lookup.
+      }
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `client_request_id ${clientRequestId} has multiple persisted delegations in ${repositoryPath}`,
+      );
+    }
+    return matches[0] ? await this.loadActiveJob(matches[0]) : undefined;
+  }
+
+  private async createDelegation(
+    request: DelegationRequest,
+    repositoryPath: string,
+  ): Promise<DelegationStartResult> {
     await assertGitRepository(repositoryPath);
     if (this.config.requireCleanRepository) {
       await assertCleanRepository(repositoryPath);
@@ -267,6 +428,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       acceptance_criteria: request.acceptance_criteria,
       checks: request.checks,
       worker_instructions: request.worker_instructions ?? request.objective,
+      client_request_id: request.client_request_id,
     });
     await writeFile(path.join(jobDirectory, "task.json"), `${JSON.stringify(task, null, 2)}\n`, "utf8");
 
@@ -281,13 +443,15 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       base_sha: baseSha,
       revision_round: 0,
       max_revision_rounds: this.config.maxRevisionRounds,
-      worker_attempts: 1,
+      worker_attempts: 0,
       codex_process_invocations: 0,
       message: "Creating isolated Git worktree",
       created_at: now,
       updated_at: now,
       changed_files: [],
       checks: [],
+      client_request_id: request.client_request_id,
+      attempt_history: [],
     };
     const job: ActiveDelegation = { task, jobDirectory, snapshot, cancelRequested: false };
     this.active.set(id, job);
@@ -299,15 +463,51 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
         state: "WORKER_RUNNING",
         message: "Antigravity worker is running",
       });
-      this.startWorker(job);
+      await this.startWorker(job, "initial");
     } catch (error) {
       await this.fail(job, error);
     }
-    return job.snapshot;
+    return { ...job.snapshot, delegation_outcome: "created" };
   }
 
   async getStatus(id: string): Promise<DelegationSnapshot> {
     return await this.loadSnapshot(id);
+  }
+
+  async getMetrics(id: string): Promise<WorkerMetrics> {
+    const snapshot = await this.loadSnapshot(id);
+    const attempts = snapshot.attempt_history;
+    let lastFailureCategory: FailureCategory | undefined;
+    for (let index = attempts.length - 1; index >= 0; index -= 1) {
+      const attempt = attempts[index];
+      if (attempt?.failure_category) {
+        lastFailureCategory = attempt.failure_category;
+        break;
+      }
+    }
+    return {
+      worker_id: id,
+      state: snapshot.state,
+      worker_attempts: snapshot.worker_attempts,
+      revision_rounds: snapshot.revision_round,
+      initial_attempts: attempts.filter((attempt) => attempt.trigger === "initial").length,
+      revision_attempts: attempts.filter((attempt) => attempt.trigger === "revision").length,
+      resume_attempts: attempts.filter((attempt) => attempt.trigger === "resume").length,
+      completed_attempts: attempts.filter((attempt) => attempt.outcome === "completed").length,
+      failed_attempts: attempts.filter((attempt) => attempt.outcome === "failed").length,
+      conversation_reuse_count: attempts.filter((attempt) => attempt.conversation_reused).length,
+      total_duration_ms: attempts.reduce((total, attempt) => total + (attempt.duration_ms ?? 0), 0),
+      total_provider_duration_ms: attempts.reduce(
+        (total, attempt) => total + (attempt.provider_duration_ms ?? 0),
+        0,
+      ),
+      total_validation_duration_ms: attempts.reduce(
+        (total, attempt) => total + (attempt.validation_duration_ms ?? 0),
+        0,
+      ),
+      ...(lastFailureCategory ? { last_failure_category: lastFailureCategory } : {}),
+      attempts,
+    };
   }
 
   async waitForWorker(id: string, timeoutMs: number): Promise<WaitWorkerResult> {
@@ -418,12 +618,11 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     job.cancelRequested = false;
     await this.update(job, {
       state: "WORKER_RUNNING",
-      worker_attempts: job.snapshot.worker_attempts + 1,
       message: "Antigravity worker is resuming after MCP server restart",
       revision_feedback: resumeFeedback,
       checks: [],
     });
-    this.startWorker(job, resumeFeedback);
+    await this.startWorker(job, "resume", resumeFeedback);
     return job.snapshot;
   }
 
@@ -446,12 +645,11 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     await this.update(job, {
       state: "WORKER_RUNNING",
       revision_round: job.snapshot.revision_round + 1,
-      worker_attempts: job.snapshot.worker_attempts + 1,
       message: "Antigravity worker is applying revision feedback",
       revision_feedback: feedback,
       checks: [],
     });
-    this.startWorker(job, feedback);
+    await this.startWorker(job, "revision", feedback);
     return job.snapshot;
   }
 
@@ -465,11 +663,31 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     await this.update(job, {
       state: "CANCELLED",
       message: "Worker cancellation requested; worktree and branch were preserved",
+      attempt_history: this.finishAttemptHistory(job, "cancelled"),
     });
     return job.snapshot;
   }
 
-  private startWorker(job: ActiveDelegation, feedback?: string): void {
+  private async startWorker(
+    job: ActiveDelegation,
+    trigger: AttemptTrigger,
+    feedback?: string,
+  ): Promise<void> {
+    const attempt = job.snapshot.worker_attempts + 1;
+    const conversationId = job.snapshot.worker_result?.conversation_id;
+    await this.update(job, {
+      worker_attempts: attempt,
+      attempt_history: [
+        ...job.snapshot.attempt_history,
+        {
+          attempt,
+          trigger,
+          started_at: new Date().toISOString(),
+          outcome: "running",
+          conversation_reused: conversationId !== undefined,
+        },
+      ],
+    });
     const controller = new AbortController();
     job.controller = controller;
     job.runPromise = this.executeWorker(job, feedback, controller.signal);
@@ -480,6 +698,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     feedback: string | undefined,
     signal: AbortSignal,
   ): Promise<void> {
+    let phase: "provider" | "validation" = "provider";
     try {
       const conversationId = job.snapshot.worker_result?.conversation_id;
       const workerRun = await this.worker.run(
@@ -500,19 +719,26 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
         state: "CHECKING",
         message: "Checking worker scope and validation commands",
         worker_result: workerRun.result,
+        attempt_history: this.patchCurrentAttempt(job, {
+          provider_duration_ms: workerRun.process.durationMs,
+        }),
       });
+      phase = "validation";
       const changedFiles = await listChangedFiles(job.task.worktree_path);
       const outOfScope = findOutOfScopeFiles(changedFiles, job.task.allowed_paths);
       let checks: CheckResult[] = [];
       let feedbackMessage: string | undefined;
+      let failureCategory: FailureCategory | undefined;
 
       if (changedFiles.length === 0) {
         feedbackMessage = "No files changed. Implement the task and produce a reviewable diff.";
+        failureCategory = "validation_failure";
       } else if (outOfScope.length > 0) {
         feedbackMessage = [
           "The diff contains files outside allowed_paths.",
           `Out-of-scope files: ${outOfScope.join(", ")}`,
         ].join("\n");
+        failureCategory = "scope_violation";
       } else {
         checks = await runValidationChecks(
           job.task.checks,
@@ -522,6 +748,9 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
         );
         if (checks.some((check) => !check.passed)) {
           feedbackMessage = `Required validation failed:\n${formatCheckFailures(checks)}`;
+          failureCategory = checks.some((check) => check.timedOut)
+            ? "timeout"
+            : "validation_failure";
         }
       }
 
@@ -535,6 +764,13 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
           revision_feedback: feedbackMessage,
           changed_files: changedFiles,
           checks: checkEvidence(checks),
+          attempt_history: this.finishAttemptHistory(
+            job,
+            "waiting_for_revision",
+            failureCategory,
+            checks,
+            false,
+          ),
         });
         return;
       }
@@ -544,6 +780,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
         changed_files: changedFiles,
         checks: checkEvidence(checks),
         revision_feedback: undefined,
+        attempt_history: this.finishAttemptHistory(job, "completed", undefined, checks, true),
       });
     } catch (error) {
       if (job.cancelRequested || signal.aborted) {
@@ -555,18 +792,74 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
         }
         return;
       }
-      await this.fail(job, error);
+      await this.fail(
+        job,
+        error,
+        phase === "validation"
+          ? ((error instanceof Error ? error.message : String(error)).toLowerCase().includes("timed out")
+              ? "timeout"
+              : "validation_failure")
+          : classifyFailure(error),
+      );
     } finally {
       delete job.controller;
       delete job.runPromise;
     }
   }
 
-  private async fail(job: ActiveDelegation, error: unknown): Promise<void> {
+  private async fail(
+    job: ActiveDelegation,
+    error: unknown,
+    failureCategory: FailureCategory = classifyFailure(error),
+  ): Promise<void> {
     await this.update(job, {
       state: "FAILED",
       message: error instanceof Error ? error.message : String(error),
+      attempt_history: this.finishAttemptHistory(job, "failed", failureCategory),
     });
+  }
+
+  private patchCurrentAttempt(
+    job: ActiveDelegation,
+    patch: Partial<WorkerAttempt>,
+  ): WorkerAttempt[] {
+    const attempts = [...job.snapshot.attempt_history];
+    for (let index = attempts.length - 1; index >= 0; index -= 1) {
+      const attempt = attempts[index];
+      if (attempt?.outcome === "running") {
+        attempts[index] = WorkerAttemptSchema.parse({ ...attempt, ...patch });
+        break;
+      }
+    }
+    return attempts;
+  }
+
+  private finishAttemptHistory(
+    job: ActiveDelegation,
+    outcome: Exclude<AttemptOutcome, "running">,
+    failureCategory?: FailureCategory,
+    checks: CheckResult[] = [],
+    validationPassed?: boolean,
+  ): WorkerAttempt[] {
+    const finishedAt = new Date();
+    const attempts = [...job.snapshot.attempt_history];
+    for (let index = attempts.length - 1; index >= 0; index -= 1) {
+      const attempt = attempts[index];
+      if (attempt?.outcome === "running") {
+        const startedAt = Date.parse(attempt.started_at);
+        attempts[index] = WorkerAttemptSchema.parse({
+          ...attempt,
+          outcome,
+          finished_at: finishedAt.toISOString(),
+          duration_ms: Number.isFinite(startedAt) ? Math.max(0, finishedAt.getTime() - startedAt) : 0,
+          validation_duration_ms: checks.reduce((total, check) => total + check.durationMs, 0),
+          ...(validationPassed !== undefined ? { validation_passed: validationPassed } : {}),
+          ...(failureCategory ? { failure_category: failureCategory } : {}),
+        });
+        break;
+      }
+    }
+    return attempts;
   }
 
   private async update(

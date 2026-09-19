@@ -71,7 +71,7 @@ export function createInteractiveMcpServer(service: InteractiveDelegationApi): M
     "delegate_to_antigravity",
     {
       title: "Delegate to Antigravity",
-      description: "After explicit user approval, create an isolated worktree and start one bounded Antigravity implementation asynchronously.",
+      description: "After explicit user approval, create an isolated worktree and start one bounded Antigravity implementation asynchronously. Supply client_request_id to make retries idempotent.",
       inputSchema: DelegationRequestSchema,
     },
     async (input) => {
@@ -111,6 +111,23 @@ export function createInteractiveMcpServer(service: InteractiveDelegationApi): M
     async ({ worker_id }) => {
       try {
         return toolResult(await service.getStatus(worker_id));
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_worker_metrics",
+    {
+      title: "Get worker metrics",
+      description: "Read persisted attempt history and measured worker, revision, resume, provider, and validation timing metrics without estimating token cost.",
+      inputSchema: z.object({ worker_id: WorkerIdSchema }).strict(),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ worker_id }) => {
+      try {
+        return toolResult(await service.getMetrics(worker_id));
       } catch (error) {
         return toolError(error);
       }

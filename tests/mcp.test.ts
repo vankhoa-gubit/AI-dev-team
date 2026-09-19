@@ -176,6 +176,19 @@ test("chat delegation supports revision, bounded diff, persistence, and safe che
     assert.equal(completed.codex_process_invocations, 0);
     assert.deepEqual(conversations, [undefined, "conversation-mcp"]);
 
+    const metrics = await service.getMetrics(started.id);
+    assert.equal(metrics.worker_attempts, 2);
+    assert.equal(metrics.initial_attempts, 1);
+    assert.equal(metrics.revision_attempts, 1);
+    assert.equal(metrics.resume_attempts, 0);
+    assert.equal(metrics.conversation_reuse_count, 1);
+    assert.equal(metrics.total_provider_duration_ms, 2);
+    assert.equal(metrics.attempts[0]?.outcome, "waiting_for_revision");
+    assert.equal(metrics.attempts[0]?.failure_category, "scope_violation");
+    assert.equal(metrics.attempts[0]?.validation_passed, false);
+    assert.equal(metrics.attempts[1]?.outcome, "completed");
+    assert.equal(metrics.attempts[1]?.validation_passed, true);
+
     const diff = await service.getDiff(started.id);
     assert.match(diff.diff, /result\.txt/);
     assert.match(diff.diff, /\+done/);
@@ -247,6 +260,63 @@ test("active workers enforce concurrency and non-overlapping scopes", async () =
   }
 });
 
+test("client request ids reuse persisted delegations and reject contract changes", async () => {
+  const fixture = await createRepository("harness-idempotency-");
+  let attempts = 0;
+  const worker: Worker = {
+    async run(task: TaskSpec) {
+      attempts += 1;
+      await new Promise<never>(() => undefined);
+      return {
+        result: {
+          status: "success", summary: "unreachable", files_changed: [], checks_attempted: [], residual_risks: [],
+        },
+        process: processResult(task.worktree_path),
+      };
+    },
+  };
+  try {
+    const request = {
+      repository_path: fixture.repoPath,
+      objective: "Idempotent task",
+      allowed_paths: ["src/idempotent/**"],
+      acceptance_criteria: ["done"],
+      checks: [],
+      client_request_id: "idempotent-task-01",
+    };
+    const firstServer = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const [first, concurrentRetry] = await Promise.all([
+      firstServer.delegate(request),
+      firstServer.delegate(request),
+    ]);
+    assert.equal(first.id, concurrentRetry.id);
+    assert.deepEqual(
+      [first.delegation_outcome, concurrentRetry.delegation_outcome].sort(),
+      ["created", "reused"],
+    );
+    assert.equal(attempts, 1);
+    assert.equal(first.worker_attempts, 1);
+    assert.equal(concurrentRetry.worker_attempts, 1);
+
+    const restartedServer = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    await restartedServer.initialize();
+    const afterRestart = await restartedServer.delegate(request);
+    assert.equal(afterRestart.id, first.id);
+    assert.equal(afterRestart.delegation_outcome, "reused");
+    assert.equal(afterRestart.state, "INTERRUPTED");
+    assert.equal(afterRestart.worker_attempts, 1);
+    assert.equal(attempts, 1);
+
+    await assert.rejects(
+      restartedServer.delegate({ ...request, objective: "Different task" }),
+      /already used.*different task contract/,
+    );
+    assert.equal(attempts, 1);
+  } finally {
+    await rm(fixture.tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("worker waiting returns terminal state and reports bounded timeout", async () => {
   const fixture = await createRepository("harness-wait-");
   const worker: Worker = {
@@ -291,6 +361,45 @@ test("worker waiting returns terminal state and reports bounded timeout", async 
     assert.equal(timedOut.timed_out, true);
     assert.equal(timedOut.snapshot.state, "WORKER_RUNNING");
     await service.cancel(slow.id);
+  } finally {
+    await rm(fixture.tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("worker metrics classify denied actions and provider timeouts", async () => {
+  const fixture = await createRepository("harness-metrics-failures-");
+  const worker: Worker = {
+    async run(task: TaskSpec): Promise<WorkerRunResult> {
+      if (task.objective === "Denied task") {
+        throw new Error("Antigravity denied required actions: read_file");
+      }
+      throw new Error("Antigravity worker timed out after 10000ms");
+    },
+  };
+  try {
+    const service = new InteractiveDelegationService(testConfig(), fixture.harnessRoot, worker);
+    const baseRequest = {
+      repository_path: fixture.repoPath,
+      objective: "Denied task",
+      allowed_paths: ["src/denied/**"],
+      acceptance_criteria: ["done"],
+      checks: [],
+    };
+    const denied = await service.delegate(baseRequest);
+    await waitForState(service, denied.id, "FAILED");
+    const deniedMetrics = await service.getMetrics(denied.id);
+    assert.equal(deniedMetrics.failed_attempts, 1);
+    assert.equal(deniedMetrics.last_failure_category, "denied_action");
+    assert.equal(deniedMetrics.attempts[0]?.outcome, "failed");
+
+    const timedOut = await service.delegate({
+      ...baseRequest,
+      objective: "Timeout task",
+      allowed_paths: ["src/timeout/**"],
+    });
+    await waitForState(service, timedOut.id, "FAILED");
+    const timeoutMetrics = await service.getMetrics(timedOut.id);
+    assert.equal(timeoutMetrics.last_failure_category, "timeout");
   } finally {
     await rm(fixture.tempRoot, { recursive: true, force: true });
   }
@@ -366,6 +475,13 @@ test("server restart marks a worker interrupted and resumes without spending a r
     assert.equal(completed.snapshot.state, "COMPLETED");
     assert.equal(completed.snapshot.revision_round, 0);
     assert.deepEqual(conversations, [undefined, "conversation-before-restart"]);
+    const metrics = await restartedServer.getMetrics(started.id);
+    assert.equal(metrics.initial_attempts, 1);
+    assert.equal(metrics.resume_attempts, 1);
+    assert.equal(metrics.revision_attempts, 0);
+    assert.equal(metrics.conversation_reuse_count, 1);
+    assert.equal(metrics.attempts[0]?.outcome, "interrupted");
+    assert.equal(metrics.attempts[1]?.outcome, "completed");
     await assert.rejects(restartedServer.resumeWorker(started.id), /cannot be resumed/);
   } finally {
     await rm(fixture.tempRoot, { recursive: true, force: true });
@@ -380,6 +496,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
     list: unavailable,
     delegate: unavailable,
     getStatus: unavailable,
+    getMetrics: unavailable,
     waitForWorker: unavailable,
     getResult: unavailable,
     getDiff: unavailable,
@@ -398,6 +515,7 @@ test("MCP server publishes the chat-native delegation toolset", async () => {
       "cancel_worker",
       "delegate_to_antigravity",
       "get_worker_diff",
+      "get_worker_metrics",
       "get_worker_result",
       "get_worker_status",
       "list_workers",

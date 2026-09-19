@@ -7,6 +7,11 @@ export const ValidationCommandSchema = z.object({
 
 export type ValidationCommand = z.infer<typeof ValidationCommandSchema>;
 
+export const ClientRequestIdSchema = z.string()
+  .min(1)
+  .max(200)
+  .regex(/^[A-Za-z0-9._:-]+$/);
+
 export const TaskContractSchema = z.object({
   objective: z.string().min(1),
   allowed_paths: z.array(z.string().min(1)).min(1),
@@ -25,6 +30,7 @@ export const TaskSpecSchema = TaskContractSchema.extend({
   base_sha: z.string().min(1),
   branch: z.string().min(1),
   max_revision_rounds: z.number().int().min(0),
+  client_request_id: ClientRequestIdSchema.optional(),
 }).strict();
 
 export type TaskSpec = z.infer<typeof TaskSpecSchema>;

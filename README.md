@@ -59,6 +59,7 @@ handoff mutations.
 - `delegate_to_antigravity`: create a bounded asynchronous worker in an isolated worktree.
 - `list_workers`: list persisted delegations, optionally filtered by repository.
 - `get_worker_status`: read current state and quota-oriented attempt metrics.
+- `get_worker_metrics`: read measured attempt history, timings, reuse, and failure categories.
 - `wait_for_worker`: wait for a terminal state or bounded timeout without repeated Codex polling.
 - `get_worker_result`: read the terminal worker result and validation evidence.
 - `get_worker_diff`: return a size-bounded Git diff, including untracked files.
@@ -79,6 +80,18 @@ Every delegation supplies:
 - `acceptance_criteria`
 - `checks` as executable-plus-argv arrays
 - optional `worker_instructions`
+- optional `client_request_id` for idempotent retries within one repository
+
+When `client_request_id` is present, retrying the same task contract returns the
+persisted worker with `delegation_outcome: "reused"` instead of creating another
+worktree or Antigravity invocation. Reusing the ID with a different contract is
+rejected. A newly created worker returns `delegation_outcome: "created"`.
+
+Each provider invocation appends a persisted attempt record with its trigger
+(`initial`, `revision`, or `resume`), measured duration, provider and validation
+timings, conversation reuse, outcome, and any known failure category. The
+harness does not estimate tokens or monetary cost when the provider does not
+report them.
 
 Avoid broad scopes such as `**` when running concurrent workers. Overlapping scopes in the same repository are rejected.
 
