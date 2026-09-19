@@ -7,8 +7,11 @@ The harness does not invoke Codex CLI, use a model gateway, plan autonomously, r
 ## Workflow
 
 1. You and Codex discuss the requirement and explicitly agree to implement it.
-2. Codex calls `delegate_to_antigravity` with an objective, allowed paths, acceptance criteria, and validation commands.
-3. The harness creates an isolated branch and Git worktree.
+2. Codex calls `preview_delegation` with the proposed objective, allowed paths,
+   acceptance criteria, checks, change budgets, and criterion/check mapping.
+3. After approval, Codex passes the returned `contract_hash` as
+   `preview_contract_hash`; the harness rejects contract or repository HEAD drift,
+   then creates an isolated branch and Git worktree.
 4. Antigravity implements the task.
 5. Codex uses a bounded `wait_for_worker` call instead of repeatedly polling status.
 6. The harness rejects denied actions, empty changes, out-of-scope files, and failed checks.
@@ -72,6 +75,9 @@ handoff mutations.
 ## MCP tools
 
 - `delegate_to_antigravity`: create a bounded asynchronous worker in an isolated worktree.
+- `preview_delegation`: perform a read-only contract preflight, normalize scope,
+  validate repository/check readiness, detect active-worker overlap, show manual
+  review gaps, and return a contract hash for the later delegation.
 - `list_workers`: list persisted delegations, optionally filtered by repository.
 - `diagnose_delegation`: inspect one or all delegation directories, including corrupt JSON, backup recovery, and Git resource health.
 - `get_worker_status`: read current state and quota-oriented attempt metrics.
@@ -103,13 +109,23 @@ Every delegation supplies:
 - `allowed_paths`
 - `acceptance_criteria`
 - `checks` as executable-plus-argv arrays
+- `budgets` with maximum changed files, diff lines, and diff bytes
+- `criterion_check_mapping`, using zero-based criterion and check indexes, to
+  distinguish automated evidence from criteria that require manual Codex review
 - optional `worker_instructions`
 - optional `client_request_id` for idempotent retries within one repository
+- optional `preview_contract_hash` copied from `preview_delegation`
 
 When `client_request_id` is present, retrying the same task contract returns the
 persisted worker with `delegation_outcome: "reused"` instead of creating another
 worktree or Antigravity invocation. Reusing the ID with a different contract is
 rejected. A newly created worker returns `delegation_outcome: "created"`.
+
+New delegations default to 50 changed files, 2,000 diff lines, and 256 KiB of
+diff when budgets are omitted. Budget gates run after every worker attempt and
+again immediately before cherry-pick preparation. Exceeding a budget moves the
+worker to `WAITING_FOR_REVISION`; it never silently truncates an oversized
+change into an approvable result.
 
 Each provider invocation appends a persisted attempt record with its trigger
 (`initial`, `revision`, or `resume`), measured duration, provider and validation

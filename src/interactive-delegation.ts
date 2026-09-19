@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
@@ -18,6 +18,7 @@ import {
   removeWorktree,
 } from "./git.js";
 import { boundText, formatCommand, pageText } from "./output.js";
+import { resolveExecutable } from "./process.js";
 import {
   inspectJsonFile,
   listCorruptEvidence,
@@ -25,9 +26,11 @@ import {
   writeJsonAtomically,
   type JsonFileState,
 } from "./persistence.js";
-import { findOverlappingScope } from "./scope.js";
+import { findOverlappingScope, normalizeScopePatterns } from "./scope.js";
 import {
+  ChangeBudgetSchema,
   ClientRequestIdSchema,
+  CriterionCheckMappingSchema,
   TaskSpecSchema,
   ValidationCommandSchema,
   WorkerResultSchema,
@@ -35,7 +38,17 @@ import {
   type TaskSpec,
   type WorkerResult,
 } from "./types.js";
-import { formatCheckFailures, runValidationChecks } from "./validation.js";
+import {
+  assertAllowedValidationCommand,
+  formatCheckFailures,
+  runValidationChecks,
+} from "./validation.js";
+
+const DEFAULT_CHANGE_BUDGET = {
+  max_changed_files: 50,
+  max_diff_lines: 2_000,
+  max_diff_bytes: 256 * 1024,
+} as const;
 
 export const DelegationRequestSchema = z.object({
   repository_path: z.string().min(1),
@@ -43,11 +56,90 @@ export const DelegationRequestSchema = z.object({
   allowed_paths: z.array(z.string().min(1)).min(1),
   acceptance_criteria: z.array(z.string().min(1)).min(1),
   checks: z.array(ValidationCommandSchema).default([]),
+  budgets: ChangeBudgetSchema.default(DEFAULT_CHANGE_BUDGET),
+  criterion_check_mapping: z.array(CriterionCheckMappingSchema).default([]),
   worker_instructions: z.string().min(1).optional(),
   client_request_id: ClientRequestIdSchema.optional(),
-}).strict();
+  preview_contract_hash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+}).strict().superRefine((value, context) => {
+  const seenCriteria = new Set<number>();
+  for (let mappingIndex = 0; mappingIndex < value.criterion_check_mapping.length; mappingIndex += 1) {
+    const mapping = value.criterion_check_mapping[mappingIndex]!;
+    if (mapping.criterion_index >= value.acceptance_criteria.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["criterion_check_mapping", mappingIndex, "criterion_index"],
+        message: `criterion_index ${mapping.criterion_index} does not reference an acceptance criterion`,
+      });
+    }
+    if (seenCriteria.has(mapping.criterion_index)) {
+      context.addIssue({
+        code: "custom",
+        path: ["criterion_check_mapping", mappingIndex, "criterion_index"],
+        message: `criterion_index ${mapping.criterion_index} is mapped more than once`,
+      });
+    }
+    seenCriteria.add(mapping.criterion_index);
+    const seenChecks = new Set<number>();
+    for (let checkIndex = 0; checkIndex < mapping.check_indices.length; checkIndex += 1) {
+      const referencedCheck = mapping.check_indices[checkIndex]!;
+      if (referencedCheck >= value.checks.length) {
+        context.addIssue({
+          code: "custom",
+          path: ["criterion_check_mapping", mappingIndex, "check_indices", checkIndex],
+          message: `check index ${referencedCheck} does not reference a validation check`,
+        });
+      }
+      if (seenChecks.has(referencedCheck)) {
+        context.addIssue({
+          code: "custom",
+          path: ["criterion_check_mapping", mappingIndex, "check_indices", checkIndex],
+          message: `check index ${referencedCheck} is duplicated for criterion ${mapping.criterion_index}`,
+        });
+      }
+      seenChecks.add(referencedCheck);
+    }
+  }
+});
 
-export type DelegationRequest = z.infer<typeof DelegationRequestSchema>;
+export type DelegationRequest = z.input<typeof DelegationRequestSchema>;
+type NormalizedDelegationRequest = z.output<typeof DelegationRequestSchema>;
+
+export interface DelegationPreview {
+  can_delegate: boolean;
+  contract_hash: string;
+  repository_path: string;
+  base_sha?: string;
+  normalized_contract: Omit<NormalizedDelegationRequest, "preview_contract_hash">;
+  budgets: NormalizedDelegationRequest["budgets"];
+  criteria: Array<{
+    criterion_index: number;
+    criterion: string;
+    verification: "automated_checks" | "manual_review";
+    check_indices: number[];
+  }>;
+  validation_commands: Array<{
+    check_index: number;
+    command: string;
+    allowed: boolean;
+    executable?: string;
+    error?: string;
+  }>;
+  active_workers: number;
+  blockers: string[];
+  warnings: string[];
+}
+
+interface BudgetEvaluation {
+  limits: NormalizedDelegationRequest["budgets"];
+  actual: {
+    changed_files: number;
+    diff_lines: number;
+    diff_bytes: number;
+  };
+  passed: boolean;
+  violations: string[];
+}
 
 export const DelegationStateSchema = z.enum([
   "PREPARING",
@@ -77,6 +169,7 @@ const FailureCategorySchema = z.enum([
   "denied_action",
   "timeout",
   "scope_violation",
+  "budget_exceeded",
   "validation_failure",
 ]);
 
@@ -157,7 +250,12 @@ export interface ReviewPacket {
   state: DelegationState;
   review_ready: boolean;
   objective: string;
-  acceptance_criteria: Array<{ criterion: string; verification: "review_required" }>;
+  acceptance_criteria: Array<{
+    criterion: string;
+    verification: "automated_checks" | "review_required";
+    check_indices: number[];
+    passed: boolean | null;
+  }>;
   allowed_paths: string[];
   base_sha: string;
   branch: string;
@@ -173,6 +271,7 @@ export interface ReviewPacket {
     passed: boolean;
     out_of_scope_files: string[];
   };
+  budget_gate: BudgetEvaluation;
   validation: {
     configured_checks: number;
     recorded_checks: number;
@@ -318,6 +417,7 @@ interface ActiveDelegation {
 export interface InteractiveDelegationApi {
   list(repositoryPath?: string): Promise<DelegationSnapshot[]>;
   diagnose(id?: string): Promise<DelegationDiagnostic[]>;
+  preview(request: DelegationRequest): Promise<DelegationPreview>;
   delegate(request: DelegationRequest): Promise<DelegationStartResult>;
   getStatus(id: string): Promise<DelegationSnapshot>;
   getMetrics(id: string): Promise<WorkerMetrics>;
@@ -389,6 +489,54 @@ function classifyFailure(error: unknown): FailureCategory {
   if (message.includes("empty output") || message.includes("empty structured output")) return "empty_output";
   if (message.includes("timed out")) return "timeout";
   return "provider_error";
+}
+
+function normalizeDelegationRequest(input: DelegationRequest): NormalizedDelegationRequest {
+  const parsed = DelegationRequestSchema.parse(input);
+  return {
+    ...parsed,
+    repository_path: path.resolve(parsed.repository_path),
+    allowed_paths: normalizeScopePatterns(parsed.allowed_paths),
+    worker_instructions: parsed.worker_instructions ?? parsed.objective,
+  };
+}
+
+function contractHash(request: NormalizedDelegationRequest, baseSha: string): string {
+  return createHash("sha256").update(JSON.stringify({
+    repository_path: request.repository_path,
+    base_sha: baseSha,
+    objective: request.objective,
+    allowed_paths: request.allowed_paths,
+    acceptance_criteria: request.acceptance_criteria,
+    checks: request.checks,
+    budgets: request.budgets,
+    criterion_check_mapping: request.criterion_check_mapping,
+    worker_instructions: request.worker_instructions ?? request.objective,
+  })).digest("hex");
+}
+
+function evaluateBudget(
+  budget: TaskSpec["budgets"] | NormalizedDelegationRequest["budgets"],
+  changedFiles: string[],
+  rawDiff: string,
+): BudgetEvaluation {
+  const limits = budget ?? DEFAULT_CHANGE_BUDGET;
+  const actual = {
+    changed_files: changedFiles.length,
+    diff_lines: rawDiff ? rawDiff.split(/\r?\n/).length : 0,
+    diff_bytes: Buffer.byteLength(rawDiff, "utf8"),
+  };
+  const violations: string[] = [];
+  if (actual.changed_files > limits.max_changed_files) {
+    violations.push(`Changed files ${actual.changed_files} exceed budget ${limits.max_changed_files}`);
+  }
+  if (actual.diff_lines > limits.max_diff_lines) {
+    violations.push(`Diff lines ${actual.diff_lines} exceed budget ${limits.max_diff_lines}`);
+  }
+  if (actual.diff_bytes > limits.max_diff_bytes) {
+    violations.push(`Diff bytes ${actual.diff_bytes} exceed budget ${limits.max_diff_bytes}`);
+  }
+  return { limits, actual, passed: violations.length === 0, violations };
 }
 
 function pathsEqual(left: string, right: string): boolean {
@@ -490,9 +638,114 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     return await Promise.all(ids.map(async (workerId) => await this.diagnoseOne(workerId)));
   }
 
+  async preview(input: DelegationRequest): Promise<DelegationPreview> {
+    const parsed = DelegationRequestSchema.parse(input);
+    const blockers: string[] = [];
+    const warnings: string[] = [];
+    let request: NormalizedDelegationRequest;
+    try {
+      request = normalizeDelegationRequest(parsed);
+    } catch (error) {
+      blockers.push(error instanceof Error ? error.message : String(error));
+      request = {
+        ...parsed,
+        repository_path: path.resolve(parsed.repository_path),
+        allowed_paths: parsed.allowed_paths.map((entry) => entry.replaceAll("\\", "/")),
+        worker_instructions: parsed.worker_instructions ?? parsed.objective,
+      };
+    }
+
+    let baseSha: string | undefined;
+    try {
+      await assertGitRepository(request.repository_path);
+      baseSha = await getHeadSha(request.repository_path);
+      if (this.config.requireCleanRepository) {
+        await assertCleanRepository(request.repository_path);
+      }
+    } catch (error) {
+      blockers.push(error instanceof Error ? error.message : String(error));
+    }
+
+    const validationCommands: DelegationPreview["validation_commands"] = [];
+    for (let checkIndex = 0; checkIndex < request.checks.length; checkIndex += 1) {
+      const check = request.checks[checkIndex]!;
+      try {
+        assertAllowedValidationCommand(check, this.config.validation.allowedExecutables);
+        const executable = await resolveExecutable(check.command);
+        validationCommands.push({
+          check_index: checkIndex,
+          command: check.command,
+          allowed: true,
+          executable,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        validationCommands.push({
+          check_index: checkIndex,
+          command: check.command,
+          allowed: false,
+          error: message,
+        });
+        blockers.push(`Check ${checkIndex}: ${message}`);
+      }
+    }
+
+    const running = [...this.active.values()].filter((job) => isActive(job.snapshot.state));
+    if (running.length >= this.config.delegation.maxConcurrentWorkers) {
+      blockers.push(`Concurrent worker limit reached (${this.config.delegation.maxConcurrentWorkers})`);
+    }
+    for (const job of running) {
+      if (!pathsEqual(job.task.repository_path, request.repository_path)) continue;
+      try {
+        const overlap = findOverlappingScope(request.allowed_paths, job.task.allowed_paths);
+        if (overlap) {
+          blockers.push(
+            `Delegation scope overlaps active worker ${job.task.id}: ${overlap.left} and ${overlap.right}`,
+          );
+        }
+      } catch (error) {
+        blockers.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    const mappingByCriterion = new Map(
+      request.criterion_check_mapping.map((mapping) => [mapping.criterion_index, mapping.check_indices]),
+    );
+    const criteria = request.acceptance_criteria.map((criterion, criterionIndex) => {
+      const checkIndices = mappingByCriterion.get(criterionIndex) ?? [];
+      if (checkIndices.length === 0) {
+        warnings.push(`Acceptance criterion ${criterionIndex} requires manual Codex review.`);
+      }
+      return {
+        criterion_index: criterionIndex,
+        criterion,
+        verification: checkIndices.length > 0 ? "automated_checks" as const : "manual_review" as const,
+        check_indices: checkIndices,
+      };
+    });
+    if (request.checks.length === 0) {
+      warnings.push("No validation commands are configured.");
+    }
+
+    const { preview_contract_hash: _previewHash, ...normalizedContract } = request;
+    return {
+      can_delegate: blockers.length === 0,
+      contract_hash: contractHash(request, baseSha ?? "unavailable"),
+      repository_path: request.repository_path,
+      ...(baseSha ? { base_sha: baseSha } : {}),
+      normalized_contract: normalizedContract,
+      budgets: request.budgets,
+      criteria,
+      validation_commands: validationCommands,
+      active_workers: running.length,
+      blockers,
+      warnings,
+    };
+  }
+
   async delegate(input: DelegationRequest): Promise<DelegationStartResult> {
-    const request = DelegationRequestSchema.parse(input);
-    const repositoryPath = path.resolve(request.repository_path);
+    const request = normalizeDelegationRequest(input);
+    const repositoryPath = request.repository_path;
     if (!request.client_request_id) {
       return await this.createDelegation(request, repositoryPath);
     }
@@ -517,7 +770,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
   }
 
   private async delegateIdempotently(
-    request: DelegationRequest,
+    request: NormalizedDelegationRequest,
     repositoryPath: string,
   ): Promise<DelegationStartResult> {
     const existing = await this.findByClientRequestId(repositoryPath, request.client_request_id!);
@@ -527,13 +780,17 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
         allowed_paths: request.allowed_paths,
         acceptance_criteria: request.acceptance_criteria,
         checks: request.checks,
+        budgets: request.budgets,
+        criterion_check_mapping: request.criterion_check_mapping,
         worker_instructions: request.worker_instructions ?? request.objective,
       });
       const existingContract = JSON.stringify({
         objective: existing.task.objective,
-        allowed_paths: existing.task.allowed_paths,
+        allowed_paths: normalizeScopePatterns(existing.task.allowed_paths),
         acceptance_criteria: existing.task.acceptance_criteria,
         checks: existing.task.checks,
+        budgets: existing.task.budgets ?? DEFAULT_CHANGE_BUDGET,
+        criterion_check_mapping: existing.task.criterion_check_mapping,
         worker_instructions: existing.task.worker_instructions,
       });
       if (expectedContract !== existingContract) {
@@ -576,7 +833,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
   }
 
   private async createDelegation(
-    request: DelegationRequest,
+    request: NormalizedDelegationRequest,
     repositoryPath: string,
   ): Promise<DelegationStartResult> {
     await assertGitRepository(repositoryPath);
@@ -605,6 +862,14 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     const worktreePath = path.join(jobDirectory, "worktree");
     const branch = `harness/${id}`;
     const baseSha = await getHeadSha(repositoryPath);
+    if (
+      request.preview_contract_hash
+      && contractHash(request, baseSha) !== request.preview_contract_hash
+    ) {
+      throw new Error(
+        "Delegation contract or repository HEAD changed after preview; run preview_delegation again",
+      );
+    }
     await mkdir(jobDirectory, { recursive: true });
 
     const task = TaskSpecSchema.parse({
@@ -619,6 +884,8 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       allowed_paths: request.allowed_paths,
       acceptance_criteria: request.acceptance_criteria,
       checks: request.checks,
+      budgets: request.budgets,
+      criterion_check_mapping: request.criterion_check_mapping,
       worker_instructions: request.worker_instructions ?? request.objective,
       client_request_id: request.client_request_id,
     });
@@ -784,6 +1051,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       : rawDiff;
     const outOfScope = findOutOfScopeFiles(changedFiles, job.task.allowed_paths);
     const diffStat = summarizeDiff(fullDiff, changedFiles);
+    const budgetGate = evaluateBudget(job.task.budgets, changedFiles, fullDiff);
     const checks = job.snapshot.checks.map((check) => ({
       command: check.command,
       args: check.args,
@@ -802,6 +1070,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     if (job.snapshot.state !== "COMPLETED") warnings.push(`Worker state is ${job.snapshot.state}, not COMPLETED.`);
     if (changedFiles.length === 0) warnings.push("No changed files are available for review.");
     if (outOfScope.length > 0) warnings.push(`Out-of-scope files: ${outOfScope.join(", ")}`);
+    if (!budgetGate.passed) warnings.push(`Change budget exceeded: ${budgetGate.violations.join("; ")}`);
     if (job.task.checks.length === 0) warnings.push("No validation commands were configured.");
     if (validationPassed === false) warnings.push("One or more configured validation checks did not pass.");
     if (residualRisks.length > 0) warnings.push("The worker reported residual risks that require reviewer attention.");
@@ -812,16 +1081,29 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
     const reviewReady = job.snapshot.state === "COMPLETED"
       && changedFiles.length > 0
       && outOfScope.length === 0
+      && budgetGate.passed
       && validationPassed !== false;
+    const mappingByCriterion = new Map(
+      job.task.criterion_check_mapping.map((mapping) => [mapping.criterion_index, mapping.check_indices]),
+    );
     return {
       worker_id: id,
       state: job.snapshot.state,
       review_ready: reviewReady,
       objective: job.task.objective,
-      acceptance_criteria: job.task.acceptance_criteria.map((criterion) => ({
-        criterion,
-        verification: "review_required" as const,
-      })),
+      acceptance_criteria: job.task.acceptance_criteria.map((criterion, criterionIndex) => {
+        const checkIndices = mappingByCriterion.get(criterionIndex) ?? [];
+        const referencedChecks = checkIndices.map((checkIndex) => checks[checkIndex]);
+        const passed = checkIndices.length === 0 || referencedChecks.some((check) => check === undefined)
+          ? null
+          : referencedChecks.every((check) => check?.passed === true);
+        return {
+          criterion,
+          verification: checkIndices.length > 0 ? "automated_checks" as const : "review_required" as const,
+          check_indices: checkIndices,
+          passed,
+        };
+      }),
       allowed_paths: job.task.allowed_paths,
       base_sha: job.task.base_sha,
       branch: job.task.branch,
@@ -832,6 +1114,7 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
         passed: outOfScope.length === 0,
         out_of_scope_files: outOfScope,
       },
+      budget_gate: budgetGate,
       validation: {
         configured_checks: job.task.checks.length,
         recorded_checks: checks.length,
@@ -872,6 +1155,11 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
       }
       if (outOfScope.length > 0) {
         throw new Error(`Delegation ${id} contains out-of-scope files: ${outOfScope.join(", ")}`);
+      }
+      const rawDiff = await getWorktreeDiff(job.task.worktree_path, job.task.base_sha);
+      const budget = evaluateBudget(job.task.budgets, changedFiles, rawDiff);
+      if (!budget.passed) {
+        throw new Error(`Change budget failed before handoff:\n${budget.violations.join("\n")}`);
       }
       const checks = await runValidationChecks(
         job.task.checks,
@@ -1127,17 +1415,28 @@ export class InteractiveDelegationService implements InteractiveDelegationApi {
         ].join("\n");
         failureCategory = "scope_violation";
       } else {
-        checks = await runValidationChecks(
-          job.task.checks,
-          job.task.worktree_path,
-          this.config.validation,
-          signal,
-        );
-        if (checks.some((check) => !check.passed)) {
-          feedbackMessage = `Required validation failed:\n${formatCheckFailures(checks)}`;
-          failureCategory = checks.some((check) => check.timedOut)
-            ? "timeout"
-            : "validation_failure";
+        const rawDiff = await getWorktreeDiff(job.task.worktree_path, job.task.base_sha);
+        const budget = evaluateBudget(job.task.budgets, changedFiles, rawDiff);
+        if (!budget.passed) {
+          feedbackMessage = [
+            "The diff exceeds the approved change budget.",
+            ...budget.violations,
+            "Reduce the change or ask Codex to preview and approve a larger budget.",
+          ].join("\n");
+          failureCategory = "budget_exceeded";
+        } else {
+          checks = await runValidationChecks(
+            job.task.checks,
+            job.task.worktree_path,
+            this.config.validation,
+            signal,
+          );
+          if (checks.some((check) => !check.passed)) {
+            feedbackMessage = `Required validation failed:\n${formatCheckFailures(checks)}`;
+            failureCategory = checks.some((check) => check.timedOut)
+              ? "timeout"
+              : "validation_failure";
+          }
         }
       }
 

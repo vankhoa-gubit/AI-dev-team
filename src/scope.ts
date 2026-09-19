@@ -18,6 +18,20 @@ function normalizeScope(pattern: string): ScopeDescriptor {
   return { kind: "tree", value: root, original: pattern };
 }
 
+export function normalizeScopePatterns(patterns: string[]): string[] {
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const pattern of patterns) {
+    const candidate = pattern.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+    normalizeScope(candidate);
+    if (!seen.has(candidate)) {
+      normalized.push(candidate);
+      seen.add(candidate);
+    }
+  }
+  return normalized;
+}
+
 function scopesOverlap(left: ScopeDescriptor, right: ScopeDescriptor): boolean {
   if (left.kind === "exact" && right.kind === "exact") {
     return left.value === right.value;
